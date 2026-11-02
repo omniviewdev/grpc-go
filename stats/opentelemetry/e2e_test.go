@@ -417,6 +417,10 @@ func (s) TestMethodAttributeFilter(t *testing.T) {
 // on the Client (no StaticMethodCallOption set) and Server. The method
 // attribute on subsequent metrics should be bucketed in "other".
 func (s) TestAllMetricsOneFunction(t *testing.T) {
+	compressedSize := testutils.CompressedMessageSize(t,
+		&testpb.SimpleRequest{Payload: &testpb.Payload{Body: make([]byte, 10000)}},
+		&testpb.SimpleResponse{Payload: &testpb.Payload{Body: make([]byte, 10000)}},
+	)
 	mo, reader := defaultMetricsOptions(t, nil)
 	ss := setupStubServer(t, mo, nil)
 	defer ss.Stop()
@@ -452,7 +456,7 @@ func (s) TestAllMetricsOneFunction(t *testing.T) {
 
 	wantMetrics := testutils.MetricData(testutils.MetricDataOptions{
 		Target:                     ss.Target,
-		UnaryCompressedMessageSize: float64(57),
+		UnaryCompressedMessageSize: float64(compressedSize),
 	})
 	gotMetrics = testutils.WaitForServerMetrics(ctx, t, reader, gotMetrics, wantMetrics)
 	testutils.CompareMetrics(t, gotMetrics, wantMetrics)
@@ -813,6 +817,10 @@ func pollForWantMetrics(ctx context.Context, t *testing.T, reader *metric.Manual
 // that the emitted metrics reflect the operations performed, including the size of
 // the compressed message, and verifies that tracing information is correctly recorded.
 func (s) TestMetricsAndTracesOptionEnabled(t *testing.T) {
+	compressedSize := testutils.CompressedMessageSize(t,
+		&testpb.SimpleRequest{Payload: &testpb.Payload{Body: make([]byte, 10000)}},
+		&testpb.SimpleResponse{Payload: &testpb.Payload{Body: make([]byte, 10000)}},
+	)
 	// Create default metrics options
 	mo, reader := defaultMetricsOptions(t, nil)
 	// Create default trace options
@@ -855,7 +863,7 @@ func (s) TestMetricsAndTracesOptionEnabled(t *testing.T) {
 
 	wantMetrics := testutils.MetricData(testutils.MetricDataOptions{
 		Target:                     ss.Target,
-		UnaryCompressedMessageSize: float64(57),
+		UnaryCompressedMessageSize: float64(compressedSize),
 	})
 	gotMetrics = testutils.WaitForServerMetrics(ctx, t, reader, gotMetrics, wantMetrics)
 	testutils.CompareMetrics(t, gotMetrics, wantMetrics)
@@ -896,7 +904,7 @@ func (s) TestMetricsAndTracesOptionEnabled(t *testing.T) {
 						},
 						{
 							Key:   "message-size-compressed",
-							Value: attribute.IntValue(57),
+							Value: attribute.IntValue(compressedSize),
 						},
 					},
 				},
@@ -913,7 +921,7 @@ func (s) TestMetricsAndTracesOptionEnabled(t *testing.T) {
 						},
 						{
 							Key:   "message-size-compressed",
-							Value: attribute.IntValue(57),
+							Value: attribute.IntValue(compressedSize),
 						},
 					},
 				},
@@ -954,7 +962,7 @@ func (s) TestMetricsAndTracesOptionEnabled(t *testing.T) {
 						},
 						{
 							Key:   "message-size-compressed",
-							Value: attribute.IntValue(57),
+							Value: attribute.IntValue(compressedSize),
 						},
 					},
 				},
@@ -971,7 +979,7 @@ func (s) TestMetricsAndTracesOptionEnabled(t *testing.T) {
 						},
 						{
 							Key:   "message-size-compressed",
-							Value: attribute.IntValue(57),
+							Value: attribute.IntValue(compressedSize),
 						},
 					},
 				},
