@@ -16,7 +16,24 @@
 
 package transport
 
-import "google.golang.org/grpc/mem"
+import (
+	"context"
+	"time"
+
+	"google.golang.org/grpc/mem"
+)
+
+// receiveServerContextErr preserves an elapsed deadline if the transport's
+// close timer wins the race with the context's own deadline timer.
+func receiveServerContextErr(ctx context.Context) error {
+	err := ctx.Err()
+	if err == context.Canceled {
+		if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+			err = context.DeadlineExceeded
+		}
+	}
+	return ContextErr(err)
+}
 
 func (r *recvBufferReader) policyNext() (recvMsg, error) {
 	p := r.policy
@@ -35,6 +52,9 @@ func (r *recvBufferReader) policyNext() (recvMsg, error) {
 		}
 		if r.clientStream != nil {
 			r.clientStream.Close(ContextErr(r.ctx.Err()))
+		}
+		if r.clientStream == nil {
+			return recvMsg{}, receiveServerContextErr(r.ctx)
 		}
 		return recvMsg{}, ContextErr(r.ctx.Err())
 	case m := <-r.recv.get():
