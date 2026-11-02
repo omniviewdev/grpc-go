@@ -25,6 +25,9 @@ The upstream installation instructions below do not select this fork.
 Before a consumer merge or release, pin the actual merged fork commit.
 A feature-branch pseudo-version is only a development pin.
 
+Coverage reports are GitHub Actions artifacts named `go-coverage`.
+The fork does not require a Codecov token.
+
 ## Prerequisites
 
 - **[Go][]**: any one of the **two latest major** [releases][go-releases].
