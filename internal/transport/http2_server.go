@@ -1349,7 +1349,7 @@ func (t *http2Server) Close(err error) {
 	for _, s := range streams {
 		s.cancel()
 		if s.receivePolicy != nil {
-			s.receivePolicy.releaseWithError(ContextErr(s.ctx.Err()))
+			s.receivePolicy.releaseWithError(receiveServerContextErr(s.ctx))
 		}
 	}
 }
@@ -1389,7 +1389,7 @@ func (t *http2Server) finishStream(s *ServerStream, rst bool, rstCode http2.ErrC
 	// called to interrupt the potential blocking on other goroutines.
 	s.cancel()
 	if s.receivePolicy != nil {
-		s.receivePolicy.releaseWithError(ContextErr(s.ctx.Err()))
+		s.receivePolicy.releaseWithError(receiveServerContextErr(s.ctx))
 	}
 
 	hdr.cleanup = &cleanupStream{
@@ -1415,7 +1415,7 @@ func (t *http2Server) closeStream(s *ServerStream, rst bool, rstCode http2.ErrCo
 	// called to interrupt the potential blocking on other goroutines.
 	s.cancel()
 	if s.receivePolicy != nil {
-		s.receivePolicy.releaseWithError(ContextErr(s.ctx.Err()))
+		s.receivePolicy.releaseWithError(receiveServerContextErr(s.ctx))
 	}
 
 	t.deleteStream(s, eosReceived)
