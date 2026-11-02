@@ -106,7 +106,11 @@ func (s *ClientStream) Close(err error) {
 		rst = true
 		rstCode = http2.ErrCodeCancel
 	}
-	s.ct.closeStream(s, err, rst, rstCode, status.Convert(err), nil, false)
+	st := status.Convert(err)
+	s.ct.closeStream(s, err, rst, rstCode, st, nil, false)
+	if err != nil && s.receivePolicy != nil {
+		s.receivePolicy.releaseWithError(st.Err())
+	}
 }
 
 // Write writes the hdr and data bytes to the output stream.
