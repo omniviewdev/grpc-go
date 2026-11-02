@@ -483,6 +483,16 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 			mdata[hf.Name] = append(mdata[hf.Name], v)
 		}
 	}
+	// Dispatch accepts method names without a leading slash. Normalize that
+	// spelling when it names a protected method so all later policy lookups
+	// and dispatch observe the same identity.
+	if len(s.method) > 0 && s.method[0] != '/' && (len(t.methodRecvLimits) != 0 || len(t.methodReadTimeouts) != 0) {
+		canonical := "/" + s.method
+		_, limited := t.methodRecvLimits[canonical]
+		if limited || t.methodReadTimeouts[canonical] > 0 {
+			s.method = canonical
+		}
+	}
 
 	// "If multiple Host headers or multiple :authority headers are present, the
 	// request must be rejected with an HTTP status code 400 as required by Host
@@ -1316,10 +1326,10 @@ func (t *http2Server) Close(err error) {
 	channelz.RemoveEntry(t.channelz.ID)
 	// Cancel all active streams.
 	for _, s := range streams {
-		if s.receivePolicy != nil {
-			s.receivePolicy.release()
-		}
 		s.cancel()
+		if s.receivePolicy != nil {
+			s.receivePolicy.releaseWithError(ContextErr(s.ctx.Err()))
+		}
 	}
 }
 
@@ -1349,10 +1359,10 @@ func (t *http2Server) finishStream(s *ServerStream, rst bool, rstCode http2.ErrC
 	// In case stream sending and receiving are invoked in separate
 	// goroutines (e.g., bi-directional streaming), cancel needs to be
 	// called to interrupt the potential blocking on other goroutines.
-	if s.receivePolicy != nil {
-		s.receivePolicy.release()
-	}
 	s.cancel()
+	if s.receivePolicy != nil {
+		s.receivePolicy.releaseWithError(ContextErr(s.ctx.Err()))
+	}
 
 	oldState := s.swapState(streamDone)
 	if oldState == streamDone {
@@ -1376,10 +1386,10 @@ func (t *http2Server) closeStream(s *ServerStream, rst bool, rstCode http2.ErrCo
 	// In case stream sending and receiving are invoked in separate
 	// goroutines (e.g., bi-directional streaming), cancel needs to be
 	// called to interrupt the potential blocking on other goroutines.
-	if s.receivePolicy != nil {
-		s.receivePolicy.release()
-	}
 	s.cancel()
+	if s.receivePolicy != nil {
+		s.receivePolicy.releaseWithError(ContextErr(s.ctx.Err()))
+	}
 
 	// We can't return early even if the stream's state is "done" as the state
 	// might have been set by the `finishStream` method. Deleting the stream via

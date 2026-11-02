@@ -54,23 +54,40 @@ type receivePolicy struct {
 	headerLen     int
 	remaining     uint32
 	deadline      time.Time
+	frameDeadline time.Time
 	timer         *time.Timer
 	stopped       bool
 	fail          func(error, bool)
 	physical      bool
-	watchPhysical bool
 	err           error
 	done          chan struct{}
 	reader        *recvBufferReader
 }
 
+// armLocked keeps one timer for the earliest logical-message or physical-frame
+// deadline. Once a stream ends, only an unfinished physical frame is watched.
+func (p *receivePolicy) armLocked() {
+	deadline := p.frameDeadline
+	if !p.stopped && !p.deadline.IsZero() && (deadline.IsZero() || p.deadline.Before(deadline)) {
+		deadline = p.deadline
+	}
+	if deadline.IsZero() {
+		if p.timer != nil {
+			p.timer.Stop()
+		}
+		return
+	}
+	delay := max(0, time.Until(deadline))
+	if p.timer == nil {
+		p.timer = time.AfterFunc(delay, p.expire)
+	} else {
+		p.timer.Reset(delay)
+	}
+}
+
 func (p *receivePolicy) abortLocked(err error) {
 	if p.releaseLocked(err) {
-		if status.Code(err) == codes.ResourceExhausted && p.physical && p.timeout > 0 && p.timer != nil {
-			p.watchPhysical = true
-			p.timer.Reset(max(0, time.Until(p.deadline)))
-		}
-		go p.fail(err, p.physical)
+		go p.fail(err, false)
 	}
 }
 
@@ -80,9 +97,7 @@ func (p *receivePolicy) releaseLocked(err error) bool {
 	}
 	p.stopped = true
 	p.err = err
-	if p.timer != nil {
-		p.timer.Stop()
-	}
+	p.armLocked()
 	if p.reader.last != nil {
 		p.reader.last.Free()
 		p.reader.last = nil
@@ -92,60 +107,77 @@ func (p *receivePolicy) releaseLocked(err error) bool {
 	return true
 }
 
-func (p *receivePolicy) release() {
+func (p *receivePolicy) releaseWithError(err error) {
+	if err == nil {
+		err = status.Error(codes.Canceled, "grpc: receive stream closed")
+	}
 	p.mu.Lock()
-	p.releaseLocked(status.Error(codes.Canceled, "grpc: receive stream closed"))
+	p.releaseLocked(err)
 	p.mu.Unlock()
 }
+
+func (p *receivePolicy) expireFrameLocked() error {
+	p.frameDeadline = time.Time{}
+	err := physicalFrameTimeout(codes.DeadlineExceeded)
+	if p.stopped {
+		go p.fail(err, true)
+	} else if p.releaseLocked(err) {
+		go p.fail(err, true)
+	}
+	return err
+}
+
 func (p *receivePolicy) expire() {
 	p.mu.Lock()
-	if p.watchPhysical {
-		if delay := time.Until(p.deadline); delay > 0 {
-			p.timer.Reset(delay)
-			p.mu.Unlock()
-			return
-		}
-		p.watchPhysical = false
-		if p.physical {
-			go p.fail(physicalFrameTimeout(codes.DeadlineExceeded), true)
-		}
+	now := time.Now()
+	if !p.stopped && !p.deadline.IsZero() && !now.Before(p.deadline) &&
+		(p.frameDeadline.IsZero() || p.deadline.Before(p.frameDeadline)) {
+		p.abortLocked(status.Error(codes.DeadlineExceeded, "grpc: partial message read timeout"))
 		p.mu.Unlock()
 		return
 	}
-	if p.stopped || p.deadline.IsZero() {
-
+	if !p.frameDeadline.IsZero() && !now.Before(p.frameDeadline) {
+		p.expireFrameLocked()
 		p.mu.Unlock()
 		return
 	}
-	if delay := time.Until(p.deadline); delay > 0 {
-		p.timer.Reset(delay)
-		p.mu.Unlock()
-		return
-	}
-	err := status.Error(codes.DeadlineExceeded, "grpc: partial message read timeout")
-	if p.physical {
-		err = physicalFrameTimeout(codes.DeadlineExceeded)
-	}
-	p.abortLocked(err)
+	p.armLocked()
 	p.mu.Unlock()
 }
 
 func (p *receivePolicy) stop() {
 	p.mu.Lock()
 	p.stopped = true
-	if p.timer != nil && !p.watchPhysical {
-		p.timer.Stop()
-	}
+	p.armLocked()
 	p.mu.Unlock()
 }
 
 func (p *receivePolicy) accept(data []byte, physical bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	now := time.Now()
+	if !p.stopped && !p.deadline.IsZero() && !now.Before(p.deadline) &&
+		(p.frameDeadline.IsZero() || p.deadline.Before(p.frameDeadline)) {
+		p.physical = physical
+		if physical && p.timeout > 0 && p.frameDeadline.IsZero() {
+			p.frameDeadline = now.Add(p.timeout)
+		} else if !physical {
+			p.frameDeadline = time.Time{}
+		}
+		err := status.Error(codes.DeadlineExceeded, "grpc: partial message read timeout")
+		p.abortLocked(err)
+		return err
+	}
+	if !p.frameDeadline.IsZero() && !now.Before(p.frameDeadline) {
+		return p.expireFrameLocked()
+	}
 	p.physical = physical
-	if p.watchPhysical && !physical {
-		p.watchPhysical = false
-		p.timer.Stop()
+	if !physical {
+		p.frameDeadline = time.Time{}
+		p.armLocked()
+	} else if p.timeout > 0 && p.frameDeadline.IsZero() {
+		p.frameDeadline = now.Add(p.timeout)
+		p.armLocked()
 	}
 	if p.stopped {
 		if p.err != nil {
@@ -153,23 +185,14 @@ func (p *receivePolicy) accept(data []byte, physical bool) error {
 		}
 		return status.Error(codes.Canceled, "grpc: receive stream closed")
 	}
-	if !p.deadline.IsZero() && !time.Now().Before(p.deadline) {
-		err := status.Error(codes.DeadlineExceeded, "grpc: partial message read timeout")
-		if p.physical {
-			err = physicalFrameTimeout(codes.DeadlineExceeded)
-		}
-		p.abortLocked(err)
-		return err
-	}
 	for len(data) != 0 {
 		if p.headerLen < len(p.header) {
 			if p.headerLen == 0 && p.timeout > 0 {
 				p.deadline = time.Now().Add(p.timeout)
-				if p.timer == nil {
-					p.timer = time.AfterFunc(p.timeout, p.expire)
-				} else {
-					p.timer.Reset(p.timeout)
+				if physical && p.frameDeadline.IsZero() {
+					p.frameDeadline = time.Now().Add(p.timeout)
 				}
+				p.armLocked()
 			}
 			n := copy(p.header[p.headerLen:], data)
 			p.headerLen += n
@@ -190,9 +213,7 @@ func (p *receivePolicy) accept(data []byte, physical bool) error {
 		if p.remaining == 0 {
 			p.headerLen = 0
 			p.deadline = time.Time{}
-			if p.timer != nil {
-				p.timer.Stop()
-			}
+			p.armLocked()
 		}
 	}
 	return nil
