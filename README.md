@@ -19,6 +19,7 @@ size limits, partial-message deadlines, failure boundaries, and native
 
 The module path remains `google.golang.org/grpc`. Each consumer module must
 select this fork in its own root `go.mod`; Go does not inherit replacements.
+Use `github.com/omniviewdev/grpc-go` as the replacement target.
 The upstream installation instructions below do not select this fork.
 
 Before a consumer merge or release, pin the actual merged fork commit.
