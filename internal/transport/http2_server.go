@@ -1347,10 +1347,10 @@ func (t *http2Server) Close(err error) {
 	channelz.RemoveEntry(t.channelz.ID)
 	// Cancel all active streams.
 	for _, s := range streams {
-		if s.receivePolicy != nil {
-			s.receivePolicy.release()
-		}
 		s.cancel()
+		if s.receivePolicy != nil {
+			s.receivePolicy.releaseWithError(ContextErr(s.ctx.Err()))
+		}
 	}
 }
 
@@ -1387,10 +1387,10 @@ func (t *http2Server) finishStream(s *ServerStream, rst bool, rstCode http2.ErrC
 	// In case stream sending and receiving are invoked in separate
 	// goroutines (e.g., bi-directional streaming), cancel needs to be
 	// called to interrupt the potential blocking on other goroutines.
-	if s.receivePolicy != nil {
-		s.receivePolicy.release()
-	}
 	s.cancel()
+	if s.receivePolicy != nil {
+		s.receivePolicy.releaseWithError(ContextErr(s.ctx.Err()))
+	}
 
 	hdr.cleanup = &cleanupStream{
 		streamID: s.id,
@@ -1413,10 +1413,10 @@ func (t *http2Server) closeStream(s *ServerStream, rst bool, rstCode http2.ErrCo
 	// In case stream sending and receiving are invoked in separate
 	// goroutines (e.g., bi-directional streaming), cancel needs to be
 	// called to interrupt the potential blocking on other goroutines.
-	if s.receivePolicy != nil {
-		s.receivePolicy.release()
-	}
 	s.cancel()
+	if s.receivePolicy != nil {
+		s.receivePolicy.releaseWithError(ContextErr(s.ctx.Err()))
+	}
 
 	t.deleteStream(s, eosReceived)
 

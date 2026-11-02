@@ -1004,16 +1004,20 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr, handler s
 	return s, nil
 }
 
-func (t *http2Client) closeStream(s *ClientStream, err error, rst bool, rstCode http2.ErrCode, st *status.Status, mdata map[string][]string, eosReceived bool) {
-	if s.receivePolicy != nil {
-		s.receivePolicy.stop()
-	}
+func (t *http2Client) closeStream(s *ClientStream, err error, rst bool, rstCode http2.ErrCode, st *status.Status, mdata map[string][]string, eosReceived bool, preserveQueued ...bool) {
 	// Set stream status to done.
 	if s.swapState(streamDone) == streamDone {
 		// If it was already done, return.  If multiple closeStream calls
 		// happen simultaneously, wait for the first to finish.
 		<-s.done
 		return
+	}
+	if s.receivePolicy != nil {
+		if len(preserveQueued) != 0 && preserveQueued[0] {
+			s.receivePolicy.stop()
+		} else {
+			s.receivePolicy.releaseWithError(st.Err())
+		}
 	}
 	// status and trailers can be updated here without any synchronization because the stream goroutine will
 	// only read it after it sees an io.EOF error from read or write and we'll write those errors
@@ -1735,7 +1739,7 @@ func (t *http2Client) operateHeaders(frame *http2.MetaHeadersFrame) {
 	// If client received END_STREAM from server while stream was still active,
 	// send RST_STREAM.
 	rstStream := s.getState() == streamActive
-	t.closeStream(s, io.EOF, rstStream, http2.ErrCodeNo, status, mdata, true)
+	t.closeStream(s, io.EOF, rstStream, http2.ErrCodeNo, status, mdata, true, true)
 }
 
 // readServerPreface reads and handles the initial settings frame from the

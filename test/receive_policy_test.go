@@ -131,10 +131,21 @@ func TestReceivePolicyTCP(t *testing.T) {
 	if err := st.fr.WriteData(7, false, []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1}); err != nil {
 		t.Fatal(err)
 	}
+	// A method name without the initial slash is malformed. The server must
+	// reject it as unimplemented instead of dispatching it past either scoped
+	// policy.
+	st.writeHeadersGRPC(9, strings.TrimPrefix(receivePolicyMethod, "/"), false)
+	if err := st.fr.WriteData(9, false, []byte{0, 0, 0, 1, 0}); err != nil {
+		t.Fatal(err)
+	}
+	st.writeHeadersGRPC(11, strings.TrimPrefix(receivePolicyMethod, "/"), false)
+	if err := st.fr.WriteData(11, false, []byte{0}); err != nil {
+		t.Fatal(err)
+	}
 	gotData := false
 	gotStatus := map[uint32]string{}
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && (!gotData || len(gotStatus) < 3) {
+	for time.Now().Before(deadline) && (!gotData || len(gotStatus) < 5) {
 		f, err := st.readFrame()
 		if err != nil {
 			t.Fatal(err)
@@ -146,13 +157,13 @@ func TestReceivePolicyTCP(t *testing.T) {
 			}
 		case *http2.MetaHeadersFrame:
 			for _, field := range f.Fields {
-				if field.Name == "grpc-status" && (f.StreamID == 3 || f.StreamID == 5 || f.StreamID == 7) {
+				if field.Name == "grpc-status" && (f.StreamID == 3 || f.StreamID == 5 || f.StreamID == 7 || f.StreamID == 9 || f.StreamID == 11) {
 					gotStatus[f.StreamID] = field.Value
 				}
 			}
 		}
 	}
-	if !gotData || gotStatus[3] != "8" || gotStatus[5] != "4" || gotStatus[7] != "4" {
+	if !gotData || gotStatus[3] != "8" || gotStatus[5] != "4" || gotStatus[7] != "4" || gotStatus[9] != "12" || gotStatus[11] != "12" {
 		t.Fatalf("healthy data=%v, statuses=%v", gotData, gotStatus)
 	}
 	// The healthy stream remains usable after all failures.
@@ -443,6 +454,12 @@ func TestClientPartialHTTP2FrameTCP(t *testing.T) {
 				first = h.StreamID
 				continue
 			}
+			// Queue a complete unread response on the other stream.
+			response := append([]byte{0, 0, 0, 0x10, 0}, make([]byte, 4096)...)
+			if err := fr.WriteData(h.StreamID, false, response); err != nil {
+				closed <- err
+				return
+			}
 			if _, err := c.Write([]byte{0, 0x40, 0, 0, 0, 0, 0, 0, byte(first), 0}); err != nil {
 				closed <- err
 				return
@@ -456,7 +473,8 @@ func TestClientPartialHTTP2FrameTCP(t *testing.T) {
 			}
 		}
 	}()
-	cc, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	pool := &receiveTrackingPool{get: make(chan *[]byte, 8), put: make(chan *[]byte, 8)}
+	cc, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()), experimental.WithBufferPool(pool))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,20 +485,35 @@ func TestClientPartialHTTP2FrameTCP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	other, err := cc.NewStream(ctx, &grpc.StreamDesc{ServerStreams: true, ClientStreams: true}, receivePolicyMethod)
+	other, err := cc.NewStream(ctx, &grpc.StreamDesc{ServerStreams: true, ClientStreams: true}, receivePolicyMethod, grpc.PartialMessageReadTimeout(time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
+	var queued *[]byte
+	select {
+	case queued = <-pool.get:
+	case <-time.After(time.Second):
+		t.Fatal("sibling DATA buffer was not acquired")
+	}
 	if err := stream.RecvMsg(&testpb.StreamingOutputCallResponse{}); status.Code(err) != codes.DeadlineExceeded || !hasPhysicalFrameTimeout(err) {
 		t.Fatalf("partial physical frame: %v", err)
-	}
-	if err := other.RecvMsg(&testpb.StreamingOutputCallResponse{}); status.Code(err) != codes.Unavailable || !hasPhysicalFrameTimeout(err) {
-		t.Fatalf("other stream on failed connection: %v", err)
 	}
 	if err := <-closed; err == nil {
 		t.Fatal("connection remained open")
 	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
 		t.Fatalf("connection did not close: %v", err)
+	}
+	var released bool
+	for !released {
+		select {
+		case b := <-pool.put:
+			released = b == queued
+		case <-time.After(time.Second):
+			t.Fatal("sibling unread buffer was not released on transport failure")
+		}
+	}
+	if err := other.RecvMsg(&testpb.StreamingOutputCallResponse{}); status.Code(err) != codes.Unavailable || !hasPhysicalFrameTimeout(err) {
+		t.Fatalf("other stream on failed connection: %v", err)
 	}
 }
 
@@ -658,5 +691,330 @@ func TestReceivePolicyOversizePartialHTTP2FrameTCP(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestReceivePolicyPaddedPhysicalFrameTCP(t *testing.T) {
+	for _, cancelHandler := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel=%v", cancelHandler), func(t *testing.T) {
+			lis, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			release := make(chan struct{})
+			pool := &receiveTrackingPool{get: make(chan *[]byte, 4), put: make(chan *[]byte, 4)}
+			srv := grpc.NewServer(grpc.MethodPartialMessageReadTimeout(receivePolicyMethod, 500*time.Millisecond), experimental.BufferPool(pool))
+			testgrpc.RegisterTestServiceServer(srv, &funcServer{fullDuplexCall: func(s testgrpc.TestService_FullDuplexCallServer) error {
+				select {
+				case <-release:
+					return nil
+				case <-s.Context().Done():
+					return s.Context().Err()
+				}
+			}})
+			go srv.Serve(lis)
+			defer srv.Stop()
+			conn, err := net.Dial("tcp", lis.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			st := newServerTesterFromConn(t, conn)
+			st.greet()
+			st.writeHeadersGRPC(1, receivePolicyMethod, false)
+			payload := bytes.Repeat([]byte{0, 0, 0, 0, 0}, 820)
+			length := 1 + len(payload) + 255
+			header := []byte{byte(length >> 16), byte(length >> 8), byte(length), 0, byte(http2.FlagDataPadded), 0, 0, 0, 1, 255}
+			if _, err := conn.Write(append(header, payload...)); err != nil {
+				t.Fatal(err)
+			}
+			var held *[]byte
+			select {
+			case held = <-pool.get:
+			case <-time.After(time.Second):
+				t.Fatal("frame buffer was not acquired")
+			}
+			if cancelHandler {
+				time.Sleep(100 * time.Millisecond)
+				close(release)
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			for {
+				_, err := st.fr.ReadFrame()
+				if err == nil {
+					continue
+				}
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					t.Fatalf("incomplete padding did not close connection: %v", err)
+				}
+				break
+			}
+			select {
+			case returned := <-pool.put:
+				if returned != held {
+					t.Fatal("unexpected buffer returned")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("padded physical frame buffer was not released")
+			}
+		})
+	}
+}
+
+func TestClientReceivePolicyCancellationReleasesLastTCP(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		c, err := lis.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		if _, err := io.ReadFull(c, make([]byte, len(http2.ClientPreface))); err != nil {
+			return
+		}
+		fr := http2.NewFramer(c, c)
+		if _, err := fr.ReadFrame(); err != nil {
+			return
+		}
+		if fr.WriteSettings() != nil {
+			return
+		}
+		for {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				return
+			}
+			h, ok := f.(*http2.HeadersFrame)
+			if !ok {
+				continue
+			}
+			var buf bytes.Buffer
+			enc := hpack.NewEncoder(&buf)
+			_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+			_ = enc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/grpc"})
+			if fr.WriteHeaders(http2.HeadersFrameParam{StreamID: h.StreamID, BlockFragment: buf.Bytes(), EndHeaders: true}) != nil {
+				return
+			}
+			data := append([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0}, make([]byte, 4096)...)
+			if fr.WriteData(h.StreamID, false, data) != nil {
+				return
+			}
+			<-done
+			return
+		}
+	}()
+	pool := &receiveTrackingPool{get: make(chan *[]byte, 8), put: make(chan *[]byte, 8)}
+	cc, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()), experimental.WithBufferPool(pool))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream, err := cc.NewStream(ctx, &grpc.StreamDesc{ServerStreams: true, ClientStreams: true}, receivePolicyMethod, grpc.PartialMessageReadTimeout(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.RecvMsg(&testpb.StreamingOutputCallResponse{}); err != nil {
+		t.Fatal(err)
+	}
+	var held *[]byte
+	select {
+	case held = <-pool.get:
+	case <-time.After(time.Second):
+		t.Fatal("DATA buffer was not acquired")
+	}
+	cancel()
+	select {
+	case returned := <-pool.put:
+		if returned != held {
+			t.Fatal("unexpected buffer returned")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("client retained unread buffer after cancellation")
+	}
+}
+
+func TestClientReceivePolicyPreservesNormalTrailersTCP(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer()
+	testgrpc.RegisterTestServiceServer(srv, &funcServer{fullDuplexCall: func(s testgrpc.TestService_FullDuplexCallServer) error {
+		return s.Send(&testpb.StreamingOutputCallResponse{})
+	}})
+	go srv.Serve(lis)
+	defer srv.Stop()
+	cc, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := cc.NewStream(ctx, &grpc.StreamDesc{ServerStreams: true, ClientStreams: true}, receivePolicyMethod, grpc.PartialMessageReadTimeout(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := stream.RecvMsg(&testpb.StreamingOutputCallResponse{}); err != nil {
+		t.Fatalf("queued response: %v", err)
+	}
+	if err := stream.RecvMsg(&testpb.StreamingOutputCallResponse{}); err != io.EOF {
+		t.Fatalf("normal trailers: %v", err)
+	}
+}
+
+func TestReceivePolicyLogicalTimeoutWithNextFrameTCP(t *testing.T) {
+	const timeout = 600 * time.Millisecond
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer(grpc.MethodPartialMessageReadTimeout(receivePolicyMethod, timeout))
+	testgrpc.RegisterTestServiceServer(srv, &funcServer{fullDuplexCall: func(s testgrpc.TestService_FullDuplexCallServer) error {
+		for {
+			if _, err := s.Recv(); err != nil {
+				return err
+			}
+			if err := s.Send(&testpb.StreamingOutputCallResponse{}); err != nil {
+				return err
+			}
+		}
+	}})
+	go srv.Serve(lis)
+	defer srv.Stop()
+	conn, err := net.Dial("tcp", lis.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	st := newServerTesterFromConn(t, conn)
+	st.greet()
+	st.writeHeadersGRPC(1, receivePolicyMethod, false)
+	if err := st.fr.WriteData(1, false, []byte{0}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(timeout / 2)
+	// Start a second physical DATA frame but do not send its byte yet.
+	if _, err := conn.Write([]byte{0, 0, 1, 0, 0, 0, 0, 0, 1}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		f, err := st.readFrame()
+		if err != nil {
+			t.Fatalf("logical timeout closed connection: %v", err)
+		}
+		h, ok := f.(*http2.MetaHeadersFrame)
+		if !ok || h.StreamID != 1 {
+			continue
+		}
+		found := false
+		for _, field := range h.Fields {
+			if field.Name == "grpc-status" {
+				if field.Value != "4" {
+					t.Fatalf("grpc-status=%s", field.Value)
+				}
+				found = true
+			}
+		}
+		if found {
+			break
+		}
+	}
+	if _, err := conn.Write([]byte{0}); err != nil {
+		t.Fatal(err)
+	}
+	st.writeHeadersGRPC(3, receivePolicyMethod, false)
+	if err := st.fr.WriteData(3, false, []byte{0, 0, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		f, err := st.readFrame()
+		if err != nil {
+			t.Fatalf("unrelated RPC after logical timeout: %v", err)
+		}
+		if d, ok := f.(*http2.DataFrame); ok && d.StreamID == 3 {
+			return
+		}
+	}
+}
+
+func TestReceivePolicyServerDeadlineStatusTCP(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := make(chan error, 1)
+	srv := grpc.NewServer(grpc.MethodPartialMessageReadTimeout(receivePolicyMethod, 3*time.Second))
+	testgrpc.RegisterTestServiceServer(srv, &funcServer{fullDuplexCall: func(s testgrpc.TestService_FullDuplexCallServer) error {
+		_, err := s.Recv()
+		observed <- err
+		return err
+	}})
+	go srv.Serve(lis)
+	defer srv.Stop()
+	cc, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_, err = cc.NewStream(ctx, &grpc.StreamDesc{ServerStreams: true, ClientStreams: true}, receivePolicyMethod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-observed:
+		if status.Code(err) != codes.DeadlineExceeded {
+			t.Fatalf("server Recv status: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("server Recv did not terminate")
+	}
+}
+
+func TestReceivePolicyUnconfiguredMethodTCP(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer(grpc.MethodMaxRecvMsgSize("/unrelated.Service/Protected", 0), grpc.MethodPartialMessageReadTimeout("/unrelated.Service/Protected", 100*time.Millisecond))
+	testgrpc.RegisterTestServiceServer(srv, &funcServer{fullDuplexCall: func(s testgrpc.TestService_FullDuplexCallServer) error {
+		if _, err := s.Recv(); err != nil {
+			return err
+		}
+		return s.Send(&testpb.StreamingOutputCallResponse{})
+	}})
+	go srv.Serve(lis)
+	defer srv.Stop()
+	conn, err := net.Dial("tcp", lis.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	st := newServerTesterFromConn(t, conn)
+	st.greet()
+	st.writeHeadersGRPC(1, strings.TrimPrefix(receivePolicyMethod, "/"), false)
+	time.Sleep(300 * time.Millisecond)
+	if err := st.fr.WriteData(1, false, []byte{0, 0, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		f, err := st.readFrame()
+		if err != nil {
+			t.Fatalf("unconfigured RPC: %v", err)
+		}
+		if d, ok := f.(*http2.DataFrame); ok && d.StreamID == 1 {
+			return
+		}
 	}
 }
