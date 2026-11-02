@@ -641,6 +641,13 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 		cancelUpdated := make(chan struct{})
 		timer := internal.TimeAfterFunc(timeout, func() {
 			<-cancelUpdated
+			if s.receivePolicy != nil {
+				err := s.trReader.reader.ctx.Err()
+				if err == nil {
+					err = context.DeadlineExceeded
+				}
+				s.receivePolicy.releaseWithError(ContextErr(err))
+			}
 			t.closeStream(s, true, http2.ErrCodeCancel, false)
 		})
 		oldCancel := s.cancel
@@ -1328,9 +1335,17 @@ func (t *http2Server) Close(err error) {
 	for _, s := range streams {
 		s.cancel()
 		if s.receivePolicy != nil {
-			s.receivePolicy.releaseWithError(receiveServerContextErr(s.ctx))
+			s.receivePolicy.releaseWithError(serverReceiveContextErr(s))
 		}
 	}
+}
+
+func serverReceiveContextErr(s *ServerStream) error {
+	err := s.trReader.reader.ctx.Err()
+	if err == nil {
+		err = context.Canceled
+	}
+	return ContextErr(err)
 }
 
 // deleteStream deletes the stream s from transport's active streams.
@@ -1361,7 +1376,7 @@ func (t *http2Server) finishStream(s *ServerStream, rst bool, rstCode http2.ErrC
 	// called to interrupt the potential blocking on other goroutines.
 	s.cancel()
 	if s.receivePolicy != nil {
-		s.receivePolicy.releaseWithError(receiveServerContextErr(s.ctx))
+		s.receivePolicy.releaseWithError(serverReceiveContextErr(s))
 	}
 
 	oldState := s.swapState(streamDone)
@@ -1388,7 +1403,7 @@ func (t *http2Server) closeStream(s *ServerStream, rst bool, rstCode http2.ErrCo
 	// called to interrupt the potential blocking on other goroutines.
 	s.cancel()
 	if s.receivePolicy != nil {
-		s.receivePolicy.releaseWithError(receiveServerContextErr(s.ctx))
+		s.receivePolicy.releaseWithError(serverReceiveContextErr(s))
 	}
 
 	// We can't return early even if the stream's state is "done" as the state

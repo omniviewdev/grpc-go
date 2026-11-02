@@ -1019,3 +1019,262 @@ func TestReceivePolicyUnconfiguredMethodTCP(t *testing.T) {
 		}
 	}
 }
+
+func TestReceivePolicyCancelBeforeDeadlineTCP(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, canceled, allowRead := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	observed := make(chan error, 1)
+	srv := grpc.NewServer(grpc.MethodPartialMessageReadTimeout(receivePolicyMethod, 3*time.Second))
+	testgrpc.RegisterTestServiceServer(srv, &funcServer{fullDuplexCall: func(s testgrpc.TestService_FullDuplexCallServer) error {
+		close(started)
+		<-s.Context().Done()
+		close(canceled)
+		<-allowRead
+		_, err := s.Recv()
+		observed <- err
+		return err
+	}})
+	go srv.Serve(lis)
+	defer srv.Stop()
+	conn, err := net.Dial("tcp", lis.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	st := newServerTesterFromConn(t, conn)
+	st.greet()
+	st.writeHeaders(http2.HeadersFrameParam{
+		StreamID: 1,
+		BlockFragment: st.encodeHeader(":method", "POST", ":path", receivePolicyMethod,
+			"content-type", "application/grpc", "te", "trailers", "grpc-timeout", "500m"),
+		EndHeaders: true,
+	})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("server handler did not start")
+	}
+	if err := st.fr.WriteRSTStream(1, http2.ErrCodeCancel); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("server did not observe cancellation")
+	}
+	time.Sleep(600 * time.Millisecond)
+	close(allowRead)
+	select {
+	case err := <-observed:
+		if status.Code(err) != codes.Canceled {
+			t.Fatalf("cancel before deadline: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server Recv did not return")
+	}
+}
+
+func TestReceivePolicySlowDripPhysicalFrameTCP(t *testing.T) {
+	const timeout = 400 * time.Millisecond
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer(grpc.MethodPartialMessageReadTimeout(receivePolicyMethod, timeout))
+	testgrpc.RegisterTestServiceServer(srv, &funcServer{fullDuplexCall: func(s testgrpc.TestService_FullDuplexCallServer) error {
+		<-s.Context().Done()
+		return s.Context().Err()
+	}})
+	go srv.Serve(lis)
+	defer srv.Stop()
+	conn, err := net.Dial("tcp", lis.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	st := newServerTesterFromConn(t, conn)
+	st.greet()
+	st.writeHeadersGRPC(1, receivePolicyMethod, false)
+	started := time.Now()
+	if _, err := conn.Write([]byte{0, 0x40, 0, 0, 0, 0, 0, 0, 1, 0}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		ticker := time.NewTicker(60 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if _, err := conn.Write([]byte{0}); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		_, err := st.fr.ReadFrame()
+		if err == nil {
+			continue
+		}
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			t.Fatalf("slow-drip frame remained open: %v", err)
+		}
+		if elapsed := time.Since(started); elapsed < timeout/2 || elapsed > 1400*time.Millisecond {
+			t.Fatalf("unexpected physical-frame deadline: %v", elapsed)
+		}
+		return
+	}
+}
+
+func TestClientReceivePolicyCancelAfterTrailersTCP(t *testing.T) {
+	for _, mode := range []string{"unread", "last", "concurrent"} {
+		t.Run(mode, func(t *testing.T) {
+			lis, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lis.Close()
+			processed := make(chan error, 1)
+			done := make(chan struct{})
+			defer close(done)
+			go func() {
+				c, err := lis.Accept()
+				if err != nil {
+					processed <- err
+					return
+				}
+				defer c.Close()
+				if _, err := io.ReadFull(c, make([]byte, len(http2.ClientPreface))); err != nil {
+					processed <- err
+					return
+				}
+				fr := http2.NewFramer(c, c)
+				if _, err := fr.ReadFrame(); err != nil {
+					processed <- err
+					return
+				}
+				if err := fr.WriteSettings(); err != nil {
+					processed <- err
+					return
+				}
+				for {
+					frame, err := fr.ReadFrame()
+					if err != nil {
+						processed <- err
+						return
+					}
+					h, ok := frame.(*http2.HeadersFrame)
+					if !ok {
+						continue
+					}
+					var buf bytes.Buffer
+					enc := hpack.NewEncoder(&buf)
+					_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+					_ = enc.WriteField(hpack.HeaderField{Name: "content-type", Value: "application/grpc"})
+					if err := fr.WriteHeaders(http2.HeadersFrameParam{StreamID: h.StreamID, BlockFragment: buf.Bytes(), EndHeaders: true}); err != nil {
+						processed <- err
+						return
+					}
+					data := bytes.Repeat([]byte{0, 0, 0, 0, 0}, 300)
+					if err := fr.WriteData(h.StreamID, false, data); err != nil {
+						processed <- err
+						return
+					}
+					if err := fr.WriteData(h.StreamID, false, data); err != nil {
+						processed <- err
+						return
+					}
+					buf.Reset()
+					enc = hpack.NewEncoder(&buf)
+					_ = enc.WriteField(hpack.HeaderField{Name: "grpc-status", Value: "0"})
+					if err := fr.WriteHeaders(http2.HeadersFrameParam{StreamID: h.StreamID, BlockFragment: buf.Bytes(), EndHeaders: true, EndStream: true}); err != nil {
+						processed <- err
+						return
+					}
+					_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+					for {
+						f, err := fr.ReadFrame()
+						if err != nil {
+							processed <- err
+							return
+						}
+						if rst, ok := f.(*http2.RSTStreamFrame); ok && rst.StreamID == h.StreamID {
+							processed <- nil
+							<-done
+							return
+						}
+					}
+				}
+			}()
+			pool := &receiveTrackingPool{get: make(chan *[]byte, 8), put: make(chan *[]byte, 8)}
+			cc, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()), experimental.WithBufferPool(pool))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cc.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			stream, err := cc.NewStream(ctx, &grpc.StreamDesc{ServerStreams: true, ClientStreams: true}, receivePolicyMethod, grpc.PartialMessageReadTimeout(time.Second))
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-processed:
+				if err != nil {
+					t.Fatalf("waiting for trailers: %v", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("client did not process trailers")
+			}
+			var buffers [2]*[]byte
+			for i := range buffers {
+				select {
+				case buffers[i] = <-pool.get:
+				case <-time.After(time.Second):
+					t.Fatal("DATA buffer was not acquired")
+				}
+			}
+			if mode == "last" {
+				if err := stream.RecvMsg(&testpb.StreamingOutputCallResponse{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			recvDone := make(chan struct{})
+			if mode == "concurrent" {
+				go func() { _ = stream.RecvMsg(&testpb.StreamingOutputCallResponse{}); close(recvDone) }()
+			}
+			cancel()
+			if mode == "concurrent" {
+				select {
+				case <-recvDone:
+				case <-time.After(time.Second):
+					t.Fatal("concurrent receive did not return")
+				}
+			}
+			returned := make(map[*[]byte]bool)
+			for len(returned) < len(buffers) {
+				select {
+				case b := <-pool.put:
+					returned[b] = true
+				case <-time.After(2 * time.Second):
+					t.Fatal("unread DATA buffers were not released")
+				}
+			}
+			for _, b := range buffers {
+				if !returned[b] {
+					t.Fatal("wrong DATA buffer returned")
+				}
+			}
+			// Keep the stream handle reachable while checking pool ownership.
+			_ = stream
+		})
+	}
+}

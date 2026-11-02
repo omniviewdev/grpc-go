@@ -58,7 +58,6 @@ type receivePolicy struct {
 	timer         *time.Timer
 	stopped       bool
 	fail          func(error, bool)
-	physical      bool
 	err           error
 	done          chan struct{}
 	reader        *recvBufferReader
@@ -158,7 +157,6 @@ func (p *receivePolicy) accept(data []byte, physical bool) error {
 	now := time.Now()
 	if !p.stopped && !p.deadline.IsZero() && !now.Before(p.deadline) &&
 		(p.frameDeadline.IsZero() || p.deadline.Before(p.frameDeadline)) {
-		p.physical = physical
 		if physical && p.timeout > 0 && p.frameDeadline.IsZero() {
 			p.frameDeadline = now.Add(p.timeout)
 		} else if !physical {
@@ -171,7 +169,6 @@ func (p *receivePolicy) accept(data []byte, physical bool) error {
 	if !p.frameDeadline.IsZero() && !now.Before(p.frameDeadline) {
 		return p.expireFrameLocked()
 	}
-	p.physical = physical
 	if !physical {
 		p.frameDeadline = time.Time{}
 		p.armLocked()
