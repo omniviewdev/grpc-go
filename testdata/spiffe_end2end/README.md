@@ -1,6 +1,7 @@
 All of the following files in this directory except `server_spiffebundle.json`
 and `client_spiffebundle.json` are generated with the `generate.sh` and
-`generate_intermediate.sh` script in this directory.
+`intermediate_gen.sh` script in this directory. The root CA and leaf
+certificates have ten-year validity periods.
 
 These comprise a root trust certificate authority (CA) that signs two
 certificates - `client_spiffe.pem` and `server_spiffe.pem`. These are valid
