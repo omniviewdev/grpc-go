@@ -160,6 +160,8 @@ type callInfo struct {
 	compressorName              string
 	failFast                    bool
 	maxReceiveMessageSize       *int
+	partialMessageReadTimeout   time.Duration
+	boundedReceive              bool
 	maxSendMessageSize          *int
 	creds                       credentials.PerRPCCredentials
 	contentSubtype              string
@@ -407,9 +409,37 @@ type MaxRecvMsgSizeCallOption struct {
 
 func (o MaxRecvMsgSizeCallOption) before(c *callInfo) error {
 	c.maxReceiveMessageSize = &o.MaxRecvMsgSize
+	c.boundedReceive = true
 	return nil
 }
 func (o MaxRecvMsgSizeCallOption) after(*callInfo, *csAttempt) {}
+
+// ReceivePolicyErrorDomain is the google.rpc.ErrorInfo domain for receive-policy errors.
+const ReceivePolicyErrorDomain = transport.ReceivePolicyErrorDomain
+
+// PartialHTTP2DataFrameTimeoutReason identifies an incomplete HTTP/2 DATA frame
+// timeout in a google.rpc.ErrorInfo detail.
+const PartialHTTP2DataFrameTimeoutReason = transport.PartialHTTP2DataFrameTimeoutReason
+
+// PartialMessageReadTimeout limits the time to receive a response message
+// after its first header byte arrives. A non-positive timeout disables it.
+// Idle time between messages is not limited. A timeout normally closes only
+// the RPC. If the peer stalls inside an incomplete HTTP/2 DATA frame, the
+// connection is closed because its frame boundary cannot be recovered.
+func PartialMessageReadTimeout(timeout time.Duration) CallOption {
+	return partialMessageReadTimeoutCallOption{timeout: timeout}
+}
+
+type partialMessageReadTimeoutCallOption struct {
+	timeout time.Duration
+}
+
+func (o partialMessageReadTimeoutCallOption) before(c *callInfo) error {
+	c.partialMessageReadTimeout = o.timeout
+	return nil
+}
+
+func (partialMessageReadTimeoutCallOption) after(*callInfo, *csAttempt) {}
 
 // CallAuthority returns a CallOption that sets the HTTP/2 :authority header of
 // an RPC to the specified value. When using CallAuthority, the credentials in
@@ -751,7 +781,8 @@ type parser struct {
 	header [5]byte
 
 	// bufferPool is the pool of shared receive buffers.
-	bufferPool mem.BufferPool
+	bufferPool     mem.BufferPool
+	boundedReceive bool
 }
 
 // recvMsg reads a complete gRPC message from the stream.
@@ -942,6 +973,9 @@ func recvAndDecompress(p *parser, s recvCompressor, dc Decompressor, maxReceiveM
 
 	if pf.isCompressed() {
 		defer compressed.Free()
+		if p.boundedReceive && dc != nil {
+			return nil, status.Error(codes.Unimplemented, "grpc: legacy decompressor cannot enforce a bounded receive size")
+		}
 		// To match legacy behavior, if the decompressor is set by WithDecompressor or RPCDecompressor,
 		// use this decompressor as the default.
 		out, err = decompress(compressor, compressed, dc, maxReceiveMessageSize, p.bufferPool)

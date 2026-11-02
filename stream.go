@@ -317,11 +317,14 @@ func newClientStreamWithParams(ctx context.Context, desc *StreamDesc, cc *Client
 	}
 
 	callHdr := &transport.CallHdr{
-		Host:           cc.authority,
-		Method:         method,
-		ContentSubtype: callInfo.contentSubtype,
-		DoneFunc:       doneFunc,
-		Authority:      callInfo.authority,
+		Host:                      cc.authority,
+		Method:                    method,
+		ContentSubtype:            callInfo.contentSubtype,
+		DoneFunc:                  doneFunc,
+		Authority:                 callInfo.authority,
+		PartialMessageReadTimeout: callInfo.partialMessageReadTimeout,
+		MaxReceiveMessageSize:     *callInfo.maxReceiveMessageSize,
+		BoundedReceive:            callInfo.boundedReceive,
 	}
 	if allowed := callInfo.acceptedResponseCompressors; len(allowed) > 0 {
 		headerValue := strings.Join(allowed, ",")
@@ -565,7 +568,7 @@ func (a *csAttempt) newStream() error {
 	}
 	a.transportStream = s
 	a.ctx = s.Context()
-	a.parser = parser{r: s, bufferPool: a.cs.cc.dopts.copts.BufferPool}
+	a.parser = parser{r: s, bufferPool: a.cs.cc.dopts.copts.BufferPool, boundedReceive: a.cs.callInfo.boundedReceive || a.cs.callInfo.partialMessageReadTimeout > 0}
 	return nil
 }
 
@@ -1311,9 +1314,12 @@ func newNonRetryClientStream(ctx context.Context, desc *StreamDesc, method strin
 	}
 
 	callHdr := &transport.CallHdr{
-		Host:           ac.cc.authority,
-		Method:         method,
-		ContentSubtype: c.contentSubtype,
+		Host:                      ac.cc.authority,
+		Method:                    method,
+		ContentSubtype:            c.contentSubtype,
+		PartialMessageReadTimeout: c.partialMessageReadTimeout,
+		MaxReceiveMessageSize:     *c.maxReceiveMessageSize,
+		BoundedReceive:            c.boundedReceive,
 	}
 
 	// Set our outgoing compression according to the UseCompressor CallOption, if
@@ -1361,7 +1367,7 @@ func newNonRetryClientStream(ctx context.Context, desc *StreamDesc, method strin
 		return nil, err
 	}
 	as.transportStream = s
-	as.parser = parser{r: s, bufferPool: ac.dopts.copts.BufferPool}
+	as.parser = parser{r: s, bufferPool: ac.dopts.copts.BufferPool, boundedReceive: c.boundedReceive || c.partialMessageReadTimeout > 0}
 	ac.incrCallsStarted()
 	if desc != unaryStreamDesc {
 		// Listen on stream context to cleanup when the stream context is

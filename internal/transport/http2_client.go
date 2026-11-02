@@ -122,10 +122,11 @@ type http2Client struct {
 	registeredCompressors string
 
 	// Do not access controlBuf with mu held.
-	mu            sync.Mutex // guard the following variables
-	nextID        uint32
-	state         transportState
-	activeStreams map[uint32]*ClientStream
+	mu              sync.Mutex // guard the following variables
+	nextID          uint32
+	state           transportState
+	activeStreams   map[uint32]*ClientStream
+	fatalReceiveErr error
 	// prevGoAway ID records the Last-Stream-ID in the previous GOAway frame.
 	prevGoAwayID uint32
 	// goAwayReason records the http2.ErrCode and debug data received with the
@@ -507,6 +508,31 @@ func (t *http2Client) newStream(ctx context.Context, callHdr *CallHdr, handler s
 			clientStream: s,
 		},
 		windowHandler: s,
+	}
+	if callHdr.PartialMessageReadTimeout > 0 || callHdr.BoundedReceive {
+		p := &receivePolicy{limit: callHdr.MaxReceiveMessageSize, hasLimit: true, timeout: callHdr.PartialMessageReadTimeout, done: make(chan struct{}), reader: &s.trReader.reader}
+		p.fail = func(err error, physical bool) {
+			if physical && status.Code(err) == codes.DeadlineExceeded {
+				t.mu.Lock()
+				t.fatalReceiveErr = err
+				t.mu.Unlock()
+				t.conn.Close()
+				t.Close(err)
+				return
+			}
+			t.closeStream(s, err, true, http2.ErrCodeCancel, status.Convert(err), nil, false)
+		}
+		s.receivePolicy = p
+		s.trReader.reader.policy = p
+		t.framer.setReceivePolicyLookup(func(id uint32) *receivePolicy {
+			t.mu.Lock()
+			stream := t.activeStreams[id]
+			t.mu.Unlock()
+			if stream == nil {
+				return nil
+			}
+			return stream.receivePolicy
+		})
 	}
 	return s
 }
@@ -931,6 +957,9 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr, handler s
 }
 
 func (t *http2Client) closeStream(s *ClientStream, err error, rst bool, rstCode http2.ErrCode, st *status.Status, mdata map[string][]string, eosReceived bool) {
+	if s.receivePolicy != nil {
+		s.receivePolicy.stop()
+	}
 	// Set stream status to done.
 	if s.swapState(streamDone) == streamDone {
 		// If it was already done, return.  If multiple closeStream calls
@@ -1024,6 +1053,7 @@ func (t *http2Client) Close(err error) {
 	// Append info about previous goaways if there were any, since this may be important
 	// for understanding the root cause for this connection to be closed.
 	goAwayDebugMessage := t.goAwayDebugMessage
+	fatalReceiveErr := t.fatalReceiveErr
 	t.mu.Unlock()
 
 	// Per HTTP/2 spec, a GOAWAY frame must be sent before closing the
@@ -1049,7 +1079,10 @@ func (t *http2Client) Close(err error) {
 	}
 	channelz.RemoveEntry(t.channelz.ID)
 	var st *status.Status
-	if len(goAwayDebugMessage) > 0 {
+	if fatalReceiveErr != nil {
+		err = physicalFrameTimeout(codes.Unavailable)
+		st = status.Convert(err)
+	} else if len(goAwayDebugMessage) > 0 {
 		st = status.Newf(codes.Unavailable, "closing transport due to: %v, received prior goaway: %v", err, goAwayDebugMessage)
 		err = st.Err()
 	} else {
