@@ -74,15 +74,17 @@ var serverConnectionCounter uint64
 
 // http2Server implements the ServerTransport interface with HTTP2.
 type http2Server struct {
-	lastRead        int64 // Keep this field 64-bit aligned. Accessed atomically.
-	done            chan struct{}
-	conn            net.Conn
-	loopy           *loopyWriter
-	readerDone      chan struct{} // sync point to enable testing.
-	loopyWriterDone chan struct{}
-	peer            peer.Peer
-	inTapHandle     tap.ServerInHandle
-	framer          *framer
+	lastRead           int64 // Keep this field 64-bit aligned. Accessed atomically.
+	done               chan struct{}
+	conn               net.Conn
+	loopy              *loopyWriter
+	readerDone         chan struct{} // sync point to enable testing.
+	loopyWriterDone    chan struct{}
+	peer               peer.Peer
+	inTapHandle        tap.ServerInHandle
+	framer             *framer
+	methodRecvLimits   map[string]int
+	methodReadTimeouts map[string]time.Duration
 	// The max number of concurrent streams.
 	maxStreams uint32
 	// controlBuf delivers all the control related tasks (e.g., window
@@ -258,23 +260,36 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 		AuthInfo:  authInfo,
 	}
 	t := &http2Server{
-		done:              done,
-		conn:              conn,
-		peer:              peer,
-		framer:            framer,
-		readerDone:        make(chan struct{}),
-		loopyWriterDone:   make(chan struct{}),
-		maxStreams:        config.MaxStreams,
-		inTapHandle:       config.InTapHandle,
-		fc:                &trInFlow{limit: uint32(icwz)},
-		state:             reachable,
-		activeStreams:     make(map[uint32]*ServerStream),
-		stats:             config.StatsHandler,
-		kp:                kp,
-		idle:              time.Now(),
-		kep:               kep,
-		initialWindowSize: iwz,
-		bufferPool:        config.BufferPool,
+		done:               done,
+		conn:               conn,
+		peer:               peer,
+		framer:             framer,
+		readerDone:         make(chan struct{}),
+		loopyWriterDone:    make(chan struct{}),
+		maxStreams:         config.MaxStreams,
+		inTapHandle:        config.InTapHandle,
+		methodRecvLimits:   config.MethodRecvLimits,
+		methodReadTimeouts: config.MethodReadTimeouts,
+		fc:                 &trInFlow{limit: uint32(icwz)},
+		state:              reachable,
+		activeStreams:      make(map[uint32]*ServerStream),
+		stats:              config.StatsHandler,
+		kp:                 kp,
+		idle:               time.Now(),
+		kep:                kep,
+		initialWindowSize:  iwz,
+		bufferPool:         config.BufferPool,
+	}
+	if len(config.MethodRecvLimits) != 0 || len(config.MethodReadTimeouts) != 0 {
+		t.framer.setReceivePolicyLookup(func(id uint32) *receivePolicy {
+			t.mu.Lock()
+			s := t.activeStreams[id]
+			t.mu.Unlock()
+			if s == nil {
+				return nil
+			}
+			return s.receivePolicy
+		})
 	}
 	t.setResetPingStrikes = func() {
 		atomic.StoreUint32(&t.resetPingStrikes, 1)
@@ -592,6 +607,31 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 		t.writeEarlyAbort(s.id, s.contentSubtype, st, http.StatusOK, !frame.StreamEnded())
 		return nil
 	}
+	s.readRequester = s
+	s.ctxDone = s.ctx.Done()
+	s.Stream.wq.init(defaultWriteQuota, s.ctxDone)
+	s.trReader = transportReader{
+		reader: recvBufferReader{
+			ctx:     s.ctx,
+			ctxDone: s.ctxDone,
+			recv:    &s.buf,
+		},
+		windowHandler: s,
+	}
+	limit, limited := t.methodRecvLimits[s.method]
+	readTimeout := t.methodReadTimeouts[s.method]
+	if limited || readTimeout > 0 {
+		p := &receivePolicy{limit: limit, hasLimit: limited, timeout: readTimeout, done: make(chan struct{}), reader: &s.trReader.reader}
+		p.fail = func(err error, physical bool) {
+			if physical && status.Code(err) == codes.DeadlineExceeded {
+				t.Close(err)
+				return
+			}
+			_ = t.writeStatus(s, status.Convert(err))
+		}
+		s.receivePolicy = p
+		s.trReader.reader.policy = p
+	}
 
 	t.activeStreams[streamID] = s
 	if len(t.activeStreams) == 1 {
@@ -618,17 +658,6 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 	if channelz.IsOn() {
 		t.channelz.SocketMetrics.StreamsStarted.Add(1)
 		t.channelz.SocketMetrics.LastRemoteStreamCreatedTimestamp.Store(time.Now().UnixNano())
-	}
-	s.readRequester = s
-	s.ctxDone = s.ctx.Done()
-	s.Stream.wq.init(defaultWriteQuota, s.ctxDone)
-	s.trReader = transportReader{
-		reader: recvBufferReader{
-			ctx:     s.ctx,
-			ctxDone: s.ctxDone,
-			recv:    &s.buf,
-		},
-		windowHandler: s,
 	}
 	// Register the stream with loopy.
 	t.controlBuf.put(&registerStream{
@@ -1318,6 +1347,9 @@ func (t *http2Server) Close(err error) {
 	channelz.RemoveEntry(t.channelz.ID)
 	// Cancel all active streams.
 	for _, s := range streams {
+		if s.receivePolicy != nil {
+			s.receivePolicy.release()
+		}
 		s.cancel()
 	}
 }
@@ -1355,6 +1387,9 @@ func (t *http2Server) finishStream(s *ServerStream, rst bool, rstCode http2.ErrC
 	// In case stream sending and receiving are invoked in separate
 	// goroutines (e.g., bi-directional streaming), cancel needs to be
 	// called to interrupt the potential blocking on other goroutines.
+	if s.receivePolicy != nil {
+		s.receivePolicy.release()
+	}
 	s.cancel()
 
 	hdr.cleanup = &cleanupStream{
@@ -1378,6 +1413,9 @@ func (t *http2Server) closeStream(s *ServerStream, rst bool, rstCode http2.ErrCo
 	// In case stream sending and receiving are invoked in separate
 	// goroutines (e.g., bi-directional streaming), cancel needs to be
 	// called to interrupt the potential blocking on other goroutines.
+	if s.receivePolicy != nil {
+		s.receivePolicy.release()
+	}
 	s.cancel()
 
 	t.deleteStream(s, eosReceived)

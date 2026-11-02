@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -412,13 +413,24 @@ func (df *parsedDataFrame) StreamEnded() bool {
 }
 
 type framer struct {
-	writer    *bufWriter
-	fr        *http2.Framer
-	headerBuf []byte // cached slice for framer headers to reduce heap allocs.
-	reader    io.Reader
-	dataFrame parsedDataFrame // Cached data frame to avoid heap allocations.
-	pool      mem.BufferPool
-	errDetail error
+	writer       *bufWriter
+	fr           *http2.Framer
+	headerBuf    []byte // cached slice for framer headers to reduce heap allocs.
+	reader       io.Reader
+	dataFrame    parsedDataFrame // Cached data frame to avoid heap allocations.
+	pool         mem.BufferPool
+	errDetail    error
+	policyLookup atomic.Pointer[receivePolicyLookup]
+}
+
+type receivePolicyLookup struct {
+	find func(uint32) *receivePolicy
+}
+
+func (f *framer) setReceivePolicyLookup(find func(uint32) *receivePolicy) {
+	if f.policyLookup.Load() == nil {
+		f.policyLookup.CompareAndSwap(nil, &receivePolicyLookup{find: find})
+	}
 }
 
 var ioBufferPoolMap = make(map[int]*imem.SimpleBufferPool)
@@ -540,6 +552,13 @@ func (f *framer) readDataFrame(fh http2.FrameHeader) (err error) {
 		f.errDetail = errors.New("DATA frame with stream ID 0")
 		return http2.ConnectionError(http2.ErrCodeProtocol)
 	}
+	var policy *receivePolicy
+	if lookup := f.policyLookup.Load(); lookup != nil {
+		policy = lookup.find(fh.StreamID)
+	}
+	if policy != nil && fh.Length != 0 {
+		_ = policy.accept(nil, true)
+	}
 	// Converting a *[]byte to a mem.SliceBuffer incurs a heap allocation. This
 	// conversion is performed by mem.NewBuffer. To avoid the extra allocation
 	// a []byte is allocated directly if required and cast to a mem.SliceBuffer.
@@ -579,12 +598,15 @@ func (f *framer) readDataFrame(fh http2.FrameHeader) (err error) {
 			f.errDetail = errors.New("pad size larger than data payload")
 			return http2.ConnectionError(http2.ErrCodeProtocol)
 		}
-		if _, err := io.ReadFull(f.reader, buf); err != nil {
+		if err := f.readPolicyFrameData(buf, len(buf)-int(padSize), policy); err != nil {
 			return err
 		}
 		buf = buf[:len(buf)-int(padSize)]
-	} else if _, err := io.ReadFull(f.reader, buf); err != nil {
+	} else if err := f.readPolicyFrameData(buf, len(buf), policy); err != nil {
 		return err
+	}
+	if policy != nil {
+		_ = policy.accept(nil, false)
 	}
 
 	f.dataFrame.FrameHeader = fh
@@ -594,6 +616,39 @@ func (f *framer) readDataFrame(fh http2.FrameHeader) (err error) {
 		f.dataFrame.data = mem.NewBuffer(poolHandle, f.pool)
 	} else {
 		f.dataFrame.data = mem.SliceBuffer(buf)
+	}
+	return nil
+}
+
+// readPolicyFrameData observes gRPC bytes as the physical DATA frame arrives.
+// Unconfigured streams retain the original single ReadFull fast path.
+func (f *framer) readPolicyFrameData(buf []byte, payloadLen int, policy *receivePolicy) error {
+	if policy == nil {
+		_, err := io.ReadFull(f.reader, buf)
+		return err
+	}
+	read := 0
+	for read < len(buf) {
+		n, err := f.reader.Read(buf[read:])
+		if n > 0 {
+			start := read
+			read += n
+			if start < payloadLen {
+				end := min(read, payloadLen)
+				_ = policy.accept(buf[start:end], read < len(buf))
+			} else if read == len(buf) {
+				_ = policy.accept(nil, false)
+			}
+		}
+		if read == len(buf) {
+			return nil
+		}
+		if err != nil {
+			if err == io.EOF && read != 0 {
+				return io.ErrUnexpectedEOF
+			}
+			return err
+		}
 	}
 	return nil
 }

@@ -166,6 +166,8 @@ type serverOptions struct {
 	statsHandlers         []stats.Handler
 	maxConcurrentStreams  uint32
 	maxReceiveMessageSize int
+	methodRecvLimits      map[string]int
+	methodReadTimeouts    map[string]time.Duration
 	maxSendMessageSize    int
 	unknownStreamDesc     *StreamDesc
 	keepaliveParams       keepalive.ServerParameters
@@ -453,6 +455,45 @@ func MaxRecvMsgSize(m int) ServerOption {
 	})
 }
 
+// MethodMaxRecvMsgSize sets the maximum received message size for a full method name.
+// The limit applies to both the wire message and its uncompressed contents.
+// If MaxRecvMsgSize is also set, the smaller limit applies. Compressed messages
+// using the deprecated Decompressor interface are rejected because that
+// interface cannot enforce a decompressed size limit.
+// Methods with this option require Server.Serve; ServeHTTP rejects them with
+// FailedPrecondition because net/http buffers request bodies independently.
+func MethodMaxRecvMsgSize(method string, maxBytes int) ServerOption {
+	return newFuncServerOption(func(o *serverOptions) {
+		if o.methodRecvLimits == nil {
+			o.methodRecvLimits = make(map[string]int)
+		}
+		o.methodRecvLimits[method] = maxBytes
+	})
+}
+
+// MethodPartialMessageReadTimeout limits the time to receive a message after
+// its first header byte arrives. A non-positive timeout disables the limit.
+// Idle time between messages is not limited. A timeout normally closes only
+// the RPC. If the peer stalls inside an incomplete HTTP/2 DATA frame, the
+// connection is closed because its frame boundary cannot be recovered.
+// Methods with an enabled timeout require Server.Serve; ServeHTTP rejects them
+// with FailedPrecondition because net/http buffers request bodies independently.
+func MethodPartialMessageReadTimeout(method string, timeout time.Duration) ServerOption {
+	return newFuncServerOption(func(o *serverOptions) {
+		if o.methodReadTimeouts == nil {
+			o.methodReadTimeouts = make(map[string]time.Duration)
+		}
+		o.methodReadTimeouts[method] = timeout
+	})
+}
+
+func (s *Server) receiveLimit(method string) int {
+	if limit, ok := s.opts.methodRecvLimits[method]; ok {
+		return min(limit, s.opts.maxReceiveMessageSize)
+	}
+	return s.opts.maxReceiveMessageSize
+}
+
 // MaxSendMsgSize returns a ServerOption to set the max message size in bytes the server can send.
 // If this is not set, gRPC uses the default `math.MaxInt32`.
 func MaxSendMsgSize(m int) ServerOption {
@@ -716,6 +757,9 @@ func NewServer(opt ...ServerOption) *Server {
 	}
 	for _, o := range opt {
 		o.apply(&opts)
+	}
+	for method, limit := range opts.methodRecvLimits {
+		opts.methodRecvLimits[method] = min(limit, opts.maxReceiveMessageSize)
 	}
 	s := &Server{
 		lis:          make(map[net.Listener]bool),
@@ -1047,6 +1091,8 @@ func (s *Server) newHTTP2Transport(c net.Conn) transport.ServerTransport {
 		HeaderTableSize:       s.opts.headerTableSize,
 		BufferPool:            s.opts.bufferPool,
 		StaticWindowSize:      s.opts.staticWindowSize,
+		MethodRecvLimits:      s.opts.methodRecvLimits,
+		MethodReadTimeouts:    s.opts.methodReadTimeouts,
 	}
 	st, err := transport.NewServerTransport(c, config)
 	if err != nil {
@@ -1133,6 +1179,9 @@ var _ http.Handler = (*Server)(nil)
 // separate from grpc-go's HTTP/2 server. Performance and features may vary
 // between the two paths. ServeHTTP does not support some gRPC features
 // available through grpc-go's HTTP/2 server.
+// Methods configured with MethodMaxRecvMsgSize or an enabled
+// MethodPartialMessageReadTimeout are rejected with FailedPrecondition. Use
+// Serve for those methods.
 //
 // # Experimental
 //
@@ -1143,6 +1192,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Errors returned from transport.NewServerHandlerTransport have
 		// already been written to w.
+		return
+	}
+	if _, limited := s.opts.methodRecvLimits[r.URL.Path]; limited || s.opts.methodReadTimeouts[r.URL.Path] > 0 {
+		w.Header().Set("Content-Type", r.Header.Get("Content-Type"))
+		w.Header().Set("Grpc-Status", "9")
+		w.Header().Set("Grpc-Message", "configured%20receive%20policy%20requires%20grpc%20Serve")
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 	if !s.addConn(listenerAddressForServeHTTP, st) {
@@ -1304,13 +1360,14 @@ func (s *Server) processRPC(ctx context.Context, stream *transport.ServerStream,
 		sh.HandleRPC(ctx, statsBegin)
 	}
 	ctx = NewContextWithServerTransportStream(ctx, stream)
+	_, boundedReceive := s.opts.methodRecvLimits[stream.Method()]
 	ss := &serverStream{
 		ctx:                   ctx,
 		s:                     stream,
-		p:                     parser{r: stream, bufferPool: s.opts.bufferPool},
+		p:                     parser{r: stream, bufferPool: s.opts.bufferPool, boundedReceive: boundedReceive},
 		codec:                 s.getCodec(stream.ContentSubtype()),
 		desc:                  sd,
-		maxReceiveMessageSize: s.opts.maxReceiveMessageSize,
+		maxReceiveMessageSize: s.receiveLimit(stream.Method()),
 		maxSendMessageSize:    s.opts.maxSendMessageSize,
 		trInfo:                trInfo,
 		statsHandler:          sh,
