@@ -960,17 +960,19 @@ func TestReceivePolicyServerDeadlineStatusTCP(t *testing.T) {
 	}})
 	go srv.Serve(lis)
 	defer srv.Stop()
-	cc, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := net.Dial("tcp", lis.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cc.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	_, err = cc.NewStream(ctx, &grpc.StreamDesc{ServerStreams: true, ClientStreams: true}, receivePolicyMethod)
-	if err != nil {
-		t.Fatal(err)
-	}
+	defer conn.Close()
+	st := newServerTesterFromConn(t, conn)
+	st.greet()
+	st.writeHeaders(http2.HeadersFrameParam{
+		StreamID: 1,
+		BlockFragment: st.encodeHeader(":method", "POST", ":path", receivePolicyMethod,
+			"content-type", "application/grpc", "te", "trailers", "grpc-timeout", "500m"),
+		EndHeaders: true,
+	})
 	select {
 	case err := <-observed:
 		if status.Code(err) != codes.DeadlineExceeded {
