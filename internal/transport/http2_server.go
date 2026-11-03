@@ -72,15 +72,17 @@ var serverConnectionCounter uint64
 
 // http2Server implements the ServerTransport interface with HTTP2.
 type http2Server struct {
-	lastRead        int64 // Keep this field 64-bit aligned. Accessed atomically.
-	done            chan struct{}
-	conn            net.Conn
-	loopy           *loopyWriter
-	readerDone      chan struct{} // sync point to enable testing.
-	loopyWriterDone chan struct{}
-	peer            peer.Peer
-	inTapHandle     tap.ServerInHandle
-	framer          *framer
+	lastRead           int64 // Keep this field 64-bit aligned. Accessed atomically.
+	done               chan struct{}
+	conn               net.Conn
+	loopy              *loopyWriter
+	readerDone         chan struct{} // sync point to enable testing.
+	loopyWriterDone    chan struct{}
+	peer               peer.Peer
+	inTapHandle        tap.ServerInHandle
+	framer             *framer
+	methodRecvLimits   map[string]int
+	methodReadTimeouts map[string]time.Duration
 	// The max number of concurrent streams.
 	maxStreams uint32
 	// controlBuf delivers all the control related tasks (e.g., window
@@ -250,23 +252,36 @@ func NewServerTransport(conn net.Conn, config *ServerConfig) (_ ServerTransport,
 		AuthInfo:  authInfo,
 	}
 	t := &http2Server{
-		done:              done,
-		conn:              conn,
-		peer:              peer,
-		framer:            framer,
-		readerDone:        make(chan struct{}),
-		loopyWriterDone:   make(chan struct{}),
-		maxStreams:        config.MaxStreams,
-		inTapHandle:       config.InTapHandle,
-		fc:                &trInFlow{limit: uint32(icwz)},
-		state:             reachable,
-		activeStreams:     make(map[uint32]*ServerStream),
-		stats:             config.StatsHandler,
-		kp:                kp,
-		idle:              time.Now(),
-		kep:               kep,
-		initialWindowSize: iwz,
-		bufferPool:        config.BufferPool,
+		done:               done,
+		conn:               conn,
+		peer:               peer,
+		framer:             framer,
+		readerDone:         make(chan struct{}),
+		loopyWriterDone:    make(chan struct{}),
+		maxStreams:         config.MaxStreams,
+		inTapHandle:        config.InTapHandle,
+		methodRecvLimits:   config.MethodRecvLimits,
+		methodReadTimeouts: config.MethodReadTimeouts,
+		fc:                 &trInFlow{limit: uint32(icwz)},
+		state:              reachable,
+		activeStreams:      make(map[uint32]*ServerStream),
+		stats:              config.StatsHandler,
+		kp:                 kp,
+		idle:               time.Now(),
+		kep:                kep,
+		initialWindowSize:  iwz,
+		bufferPool:         config.BufferPool,
+	}
+	if len(config.MethodRecvLimits) != 0 || len(config.MethodReadTimeouts) != 0 {
+		t.framer.setReceivePolicyLookup(func(id uint32) *receivePolicy {
+			t.mu.Lock()
+			s := t.activeStreams[id]
+			t.mu.Unlock()
+			if s == nil {
+				return nil
+			}
+			return s.receivePolicy
+		})
 	}
 	t.setResetPingStrikes = func() {
 		atomic.StoreUint32(&t.resetPingStrikes, 1)
@@ -468,6 +483,16 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 			mdata[hf.Name] = append(mdata[hf.Name], v)
 		}
 	}
+	// Dispatch accepts method names without a leading slash. Normalize that
+	// spelling when it names a protected method so all later policy lookups
+	// and dispatch observe the same identity.
+	if len(s.method) > 0 && s.method[0] != '/' && (len(t.methodRecvLimits) != 0 || len(t.methodReadTimeouts) != 0) {
+		canonical := "/" + s.method
+		_, limited := t.methodRecvLimits[canonical]
+		if limited || t.methodReadTimeouts[canonical] > 0 {
+			s.method = canonical
+		}
+	}
 
 	// "If multiple Host headers or multiple :authority headers are present, the
 	// request must be rejected with an HTTP status code 400 as required by Host
@@ -578,6 +603,31 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 		t.writeEarlyAbort(s.id, s.contentSubtype, st, http.StatusOK, !frame.StreamEnded())
 		return nil
 	}
+	s.readRequester = s
+	s.ctxDone = s.ctx.Done()
+	s.Stream.wq.init(defaultWriteQuota, s.ctxDone)
+	s.trReader = transportReader{
+		reader: recvBufferReader{
+			ctx:     s.ctx,
+			ctxDone: s.ctxDone,
+			recv:    &s.buf,
+		},
+		windowHandler: s,
+	}
+	limit, limited := t.methodRecvLimits[s.method]
+	readTimeout := t.methodReadTimeouts[s.method]
+	if limited || readTimeout > 0 {
+		p := &receivePolicy{limit: limit, hasLimit: limited, timeout: readTimeout, done: make(chan struct{}), reader: &s.trReader.reader}
+		p.fail = func(err error, physical bool) {
+			if physical && status.Code(err) == codes.DeadlineExceeded {
+				t.Close(err)
+				return
+			}
+			_ = t.writeStatus(s, status.Convert(err))
+		}
+		s.receivePolicy = p
+		s.trReader.reader.policy = p
+	}
 
 	t.activeStreams[streamID] = s
 	if len(t.activeStreams) == 1 {
@@ -591,6 +641,13 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 		cancelUpdated := make(chan struct{})
 		timer := internal.TimeAfterFunc(timeout, func() {
 			<-cancelUpdated
+			if s.receivePolicy != nil {
+				err := s.trReader.reader.ctx.Err()
+				if err == nil {
+					err = context.DeadlineExceeded
+				}
+				s.receivePolicy.releaseWithError(ContextErr(err))
+			}
 			t.closeStream(s, true, http2.ErrCodeCancel, false)
 		})
 		oldCancel := s.cancel
@@ -604,17 +661,6 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
 	if channelz.IsOn() {
 		t.channelz.SocketMetrics.StreamsStarted.Add(1)
 		t.channelz.SocketMetrics.LastRemoteStreamCreatedTimestamp.Store(time.Now().UnixNano())
-	}
-	s.readRequester = s
-	s.ctxDone = s.ctx.Done()
-	s.Stream.wq.init(defaultWriteQuota, s.ctxDone)
-	s.trReader = transportReader{
-		reader: recvBufferReader{
-			ctx:     s.ctx,
-			ctxDone: s.ctxDone,
-			recv:    &s.buf,
-		},
-		windowHandler: s,
 	}
 	// Register the stream with loopy.
 	t.controlBuf.put(&registerStream{
@@ -1288,7 +1334,18 @@ func (t *http2Server) Close(err error) {
 	// Cancel all active streams.
 	for _, s := range streams {
 		s.cancel()
+		if s.receivePolicy != nil {
+			s.receivePolicy.releaseWithError(serverReceiveContextErr(s))
+		}
 	}
+}
+
+func serverReceiveContextErr(s *ServerStream) error {
+	err := s.trReader.reader.ctx.Err()
+	if err == nil {
+		err = context.Canceled
+	}
+	return ContextErr(err)
 }
 
 // deleteStream deletes the stream s from transport's active streams.
@@ -1318,6 +1375,9 @@ func (t *http2Server) finishStream(s *ServerStream, rst bool, rstCode http2.ErrC
 	// goroutines (e.g., bi-directional streaming), cancel needs to be
 	// called to interrupt the potential blocking on other goroutines.
 	s.cancel()
+	if s.receivePolicy != nil {
+		s.receivePolicy.releaseWithError(serverReceiveContextErr(s))
+	}
 
 	oldState := s.swapState(streamDone)
 	if oldState == streamDone {
@@ -1342,6 +1402,9 @@ func (t *http2Server) closeStream(s *ServerStream, rst bool, rstCode http2.ErrCo
 	// goroutines (e.g., bi-directional streaming), cancel needs to be
 	// called to interrupt the potential blocking on other goroutines.
 	s.cancel()
+	if s.receivePolicy != nil {
+		s.receivePolicy.releaseWithError(serverReceiveContextErr(s))
+	}
 
 	// We can't return early even if the stream's state is "done" as the state
 	// might have been set by the `finishStream` method. Deleting the stream via

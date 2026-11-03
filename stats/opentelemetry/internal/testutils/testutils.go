@@ -18,6 +18,8 @@
 package testutils
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"slices"
@@ -28,6 +30,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata/metricdatatest"
+	"google.golang.org/protobuf/proto"
 )
 
 // Redefine default bounds here to avoid a cyclic dependency with top level
@@ -39,6 +42,32 @@ var (
 	// DefaultSizeBounds are the default bounds for metrics which record size.
 	DefaultSizeBounds = []float64{0, 1024, 2048, 4096, 16384, 65536, 262144, 1048576, 4194304, 16777216, 67108864, 268435456, 1073741824, 4294967296}
 )
+
+// CompressedMessageSize returns the gzip wire payload size of the messages,
+// failing if the fixtures do not share the size expected by metric tests.
+func CompressedMessageSize(t *testing.T, messages ...proto.Message) int {
+	t.Helper()
+	size := -1
+	for _, message := range messages {
+		wire, err := proto.Marshal(message)
+		if err != nil {
+			t.Fatalf("marshal compressed message fixture: %v", err)
+		}
+		var buf bytes.Buffer
+		writer := gzip.NewWriter(&buf)
+		if _, err := writer.Write(wire); err != nil {
+			t.Fatalf("compress message fixture: %v", err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatalf("finish compressed message fixture: %v", err)
+		}
+		if size >= 0 && size != buf.Len() {
+			t.Fatalf("compressed message fixtures have different sizes: %d and %d", size, buf.Len())
+		}
+		size = buf.Len()
+	}
+	return size
+}
 
 // waitForServerCompletedRPCs waits until the unary and streaming stats.End
 // calls are finished processing. It does this by waiting for the expected

@@ -94,6 +94,10 @@ func setupEnv(t *testing.T, resourceDetectorEmissions map[string]string, meshID,
 // provided OpenTelemetry SDK's Meter Provider. The CSM Labels emitted from the
 // plugin option should be attached to the relevant metrics.
 func (s) TestCSMPluginOptionUnary(t *testing.T) {
+	compressedSize := itestutils.CompressedMessageSize(t,
+		&testpb.SimpleRequest{Payload: &testpb.Payload{Body: make([]byte, 10000)}},
+		&testpb.SimpleResponse{Payload: &testpb.Payload{Body: make([]byte, 10000)}},
+	)
 	resourceDetectorEmissions := map[string]string{
 		"cloud.platform":     "gcp_kubernetes_engine",
 		"cloud.region":       "cloud_region_val", // availability_zone isn't present, so this should become location
@@ -143,7 +147,7 @@ func (s) TestCSMPluginOptionUnary(t *testing.T) {
 			},
 			opts: itestutils.MetricDataOptions{
 				CSMLabels:                  csmLabels,
-				UnaryCompressedMessageSize: float64(57),
+				UnaryCompressedMessageSize: float64(compressedSize),
 			},
 		},
 		{
@@ -167,7 +171,7 @@ func (s) TestCSMPluginOptionUnary(t *testing.T) {
 			},
 			opts: itestutils.MetricDataOptions{
 				CSMLabels:                  csmLabels,
-				UnaryCompressedMessageSize: float64(57),
+				UnaryCompressedMessageSize: float64(compressedSize),
 			},
 		},
 		{
@@ -181,7 +185,7 @@ func (s) TestCSMPluginOptionUnary(t *testing.T) {
 			},
 			opts: itestutils.MetricDataOptions{
 				CSMLabels:                  csmLabels,
-				UnaryCompressedMessageSize: float64(57),
+				UnaryCompressedMessageSize: float64(compressedSize),
 			},
 		},
 		{
@@ -193,7 +197,7 @@ func (s) TestCSMPluginOptionUnary(t *testing.T) {
 			},
 			opts: itestutils.MetricDataOptions{
 				CSMLabels:                  csmLabels,
-				UnaryCompressedMessageSize: float64(57),
+				UnaryCompressedMessageSize: float64(compressedSize),
 			},
 		},
 	}
@@ -262,6 +266,10 @@ func (s) TestCSMPluginOptionUnary(t *testing.T) {
 // provided OpenTelemetry SDK's Meter Provider. The CSM Labels emitted from the
 // plugin option should be attached to the relevant metrics.
 func (s) TestCSMPluginOptionStreaming(t *testing.T) {
+	compressedSize := itestutils.CompressedMessageSize(t,
+		&testpb.StreamingOutputCallRequest{Payload: &testpb.Payload{Body: make([]byte, 10000)}},
+		&testpb.StreamingOutputCallResponse{Payload: &testpb.Payload{Body: make([]byte, 10000)}},
+	)
 	resourceDetectorEmissions := map[string]string{
 		"cloud.platform":     "gcp_kubernetes_engine",
 		"cloud.region":       "cloud_region_val", // availability_zone isn't present, so this should become location
@@ -357,7 +365,7 @@ func (s) TestCSMPluginOptionStreaming(t *testing.T) {
 			},
 			opts: itestutils.MetricDataOptions{
 				CSMLabels:                      csmLabels,
-				StreamingCompressedMessageSize: float64(57),
+				StreamingCompressedMessageSize: float64(compressedSize),
 			},
 		},
 	}
@@ -519,9 +527,12 @@ func (s) TestXDSLabels(t *testing.T) {
 		remoteWorkloadCanonicalServiceAttr,
 	}
 
-	unaryCompressedBytesSentRecv := int64(57) // Fixed 10000 bytes with gzip assumption.
+	unaryCompressedBytesSentRecv := int64(itestutils.CompressedMessageSize(t,
+		&testpb.SimpleRequest{Payload: &testpb.Payload{Body: make([]byte, 10000)}},
+		&testpb.SimpleResponse{Payload: &testpb.Payload{Body: make([]byte, 10000)}},
+	))
 	unaryBucketCounts := []uint64{0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}
-	unaryExtrema := metricdata.NewExtrema(int64(57))
+	unaryExtrema := metricdata.NewExtrema(unaryCompressedBytesSentRecv)
 	wantMetrics := []metricdata.Metrics{
 		{
 			Name:        "grpc.client.attempt.started",

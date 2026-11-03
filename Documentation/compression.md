@@ -78,3 +78,36 @@ For outgoing responses, the following rules are applied in order:
    supports it, that same compression method will be used for the outgoing
    response.
 1. Otherwise, no compression will be used for the outgoing response.
+
+## Bounded receives
+
+`MethodMaxRecvMsgSize` sets a receive limit for a full server method name.
+`MaxCallRecvMsgSize` sets a client call's receive limit. For a configured
+bounded receive, the limit applies to both the transmitted message and the
+decompressed message. The deprecated `Decompressor` interface returns a
+complete byte slice, so it cannot enforce that bound during decompression.
+Compressed messages using that legacy interface are rejected with
+`Unimplemented` for bounded receives. Use a registered `encoding.Compressor`
+instead.
+
+`MethodPartialMessageReadTimeout` configures a server method's partial-message
+timeout, and `PartialMessageReadTimeout` configures a client call's timeout.
+The message timer starts at the first byte of a message and stops when its wire
+payload is complete; it does not run while waiting for the next message. A
+timeout in complete HTTP/2 frames terminates only the affected RPC. An
+incomplete physical DATA frame has a separate absolute deadline from its
+header; progress does not reset it. That deadline continues even after the
+message completes or the RPC is canceled. On expiry the transport closes the
+connection: HTTP/2 cannot resume parsing another frame until the missing bytes
+arrive. This also terminates other RPCs on that unhealthy connection.
+If still active when the client transport detects this failure, the affected
+RPC receives `DeadlineExceeded`; other RPCs on that connection receive `Unavailable`.
+Both include a `google.rpc.ErrorInfo` detail with domain
+`grpc.ReceivePolicyErrorDomain` and reason `grpc.PartialHTTP2DataFrameTimeoutReason`.
+An ordinary partial-message timeout has no such detail. A peer whose connection
+is closed cannot be guaranteed to receive the cause across the broken transport.
+
+Server method receive controls require the native `Server.Serve` transport.
+`Server.ServeHTTP` rejects methods with an enabled receive control with
+`FailedPrecondition` because the `net/http` HTTP/2 server buffers request
+bodies independently. Unconfigured methods retain their existing behavior.

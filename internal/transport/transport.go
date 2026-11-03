@@ -80,7 +80,9 @@ func (b *recvBuffer) put(r recvMsg) {
 	if b.err != nil {
 		// drop the buffer on the floor. Since b.err is not nil, any subsequent reads
 		// will always return an error, making this buffer inaccessible.
-		r.buffer.Free()
+		if r.buffer != nil {
+			r.buffer.Free()
+		}
 		b.mu.Unlock()
 		// An error had occurred earlier, don't accept more
 		// data or errors.
@@ -112,6 +114,26 @@ func (b *recvBuffer) load() {
 	b.mu.Unlock()
 }
 
+// discard rejects future writes and releases all queued buffers.
+func (b *recvBuffer) discard(err error) {
+	b.mu.Lock()
+	b.err = err
+	select {
+	case m := <-b.c:
+		if m.buffer != nil {
+			m.buffer.Free()
+		}
+	default:
+	}
+	for _, m := range b.backlog {
+		if m.buffer != nil {
+			m.buffer.Free()
+		}
+	}
+	b.backlog = nil
+	b.mu.Unlock()
+}
+
 // get returns the channel that receives a recvMsg in the buffer.
 //
 // Upon receipt of a recvMsg, the caller should call load to send another
@@ -130,9 +152,13 @@ type recvBufferReader struct {
 	recv         *recvBuffer
 	last         mem.Buffer // Stores the remaining data in the previous calls.
 	err          error
+	policy       *receivePolicy
 }
 
 func (r *recvBufferReader) ReadMessageHeader(header []byte) (n int, err error) {
+	if r.policy != nil {
+		return r.readPolicyHeader(header)
+	}
 	if r.err != nil {
 		return 0, r.err
 	}
@@ -153,6 +179,9 @@ func (r *recvBufferReader) ReadMessageHeader(header []byte) (n int, err error) {
 // recv. If Read returns any non-nil error, it will continue to return that
 // error.
 func (r *recvBufferReader) Read(n int) (buf mem.Buffer, err error) {
+	if r.policy != nil {
+		return r.readPolicy(n)
+	}
 	if r.err != nil {
 		return nil, r.err
 	}
@@ -286,10 +315,11 @@ const (
 
 // Stream represents an RPC in the transport layer.
 type Stream struct {
-	ctx          context.Context // the associated context of the stream
-	method       string          // the associated RPC method of the stream
-	recvCompress string
-	sendCompress string
+	ctx           context.Context // the associated context of the stream
+	method        string          // the associated RPC method of the stream
+	recvCompress  string
+	sendCompress  string
+	receivePolicy *receivePolicy
 
 	readRequester readRequester
 
@@ -507,6 +537,8 @@ type ServerConfig struct {
 	HeaderTableSize       *uint32
 	BufferPool            mem.BufferPool
 	StaticWindowSize      bool
+	MethodRecvLimits      map[string]int
+	MethodReadTimeouts    map[string]time.Duration
 }
 
 // ConnectOptions covers all relevant options for communicating with the server.
@@ -565,6 +597,9 @@ type CallHdr struct {
 	// Method specifies the operation to perform.
 	Method string
 
+	PartialMessageReadTimeout time.Duration
+	MaxReceiveMessageSize     int
+	BoundedReceive            bool
 	// SendCompress specifies the compression algorithm applied on
 	// outbound message.
 	SendCompress string

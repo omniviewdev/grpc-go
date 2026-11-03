@@ -1,4 +1,4 @@
-name: codecov
+name: Coverage
 on: [push, pull_request]
 
 permissions:
@@ -19,8 +19,9 @@ jobs:
       - name: Run coverage
         run: go test -coverprofile=coverage.out -coverpkg=./... ./...
 
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+      - name: Retain coverage report
+        uses: actions/upload-artifact@v4
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: true
+          name: go-coverage
+          path: coverage.out
+          if-no-files-found: error

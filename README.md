@@ -8,6 +8,26 @@ The [Go][] implementation of [gRPC][]: A high performance, open source, general
 RPC framework that puts mobile and HTTP/2 first. For more information see the
 [Go gRPC docs][], or jump directly into the [quick start][].
 
+## Omniview maintenance fork
+
+This fork adds scoped receive controls to upstream gRPC-Go v1.79.2.
+The maintenance branch is `omniview-v1.79`.
+
+See [the receive policy](Documentation/compression.md) for the method-scoped
+size limits, partial-message deadlines, failure boundaries, and native
+`Server.Serve` requirement.
+
+The module path remains `google.golang.org/grpc`. Each consumer module must
+select this fork in its own root `go.mod`; Go does not inherit replacements.
+Use `github.com/omniviewdev/grpc-go` as the replacement target.
+The upstream installation instructions below do not select this fork.
+
+Before a consumer merge or release, pin the actual merged fork commit.
+A feature-branch pseudo-version is only a development pin.
+
+Coverage reports are GitHub Actions artifacts named `go-coverage`.
+The fork does not require a Codecov token.
+
 ## Prerequisites
 
 - **[Go][]**: any one of the **two latest major** [releases][go-releases].
