@@ -206,6 +206,62 @@ func (s) TestReceivePolicyCompressedExpansionTCP(t *testing.T) {
 	}
 }
 
+// v1.85 compacts many small queued DATA buffers into one. A policy stream must
+// still deliver every queued message exactly once when the handler reads late.
+func (s) TestReceivePolicyCompactedBacklogTCP(t *testing.T) {
+	const messages = 4000
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	counted := make(chan int, 1)
+	srv := grpc.NewServer(grpc.MethodMaxRecvMsgSize(receivePolicyMethod, 64), grpc.MethodPartialMessageReadTimeout(receivePolicyMethod, 5*time.Second))
+	testgrpc.RegisterTestServiceServer(srv, &funcServer{fullDuplexCall: func(s testgrpc.TestService_FullDuplexCallServer) error {
+		<-release
+		n := 0
+		for {
+			if _, err := s.Recv(); err != nil {
+				if err != io.EOF {
+					n = -1
+				}
+				counted <- n
+				return nil
+			}
+			n++
+		}
+	}})
+	go srv.Serve(lis)
+	defer srv.Stop()
+	conn, err := net.Dial("tcp", lis.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	st := newServerTesterFromConn(t, conn)
+	st.greet()
+	st.writeHeadersGRPC(1, receivePolicyMethod, false)
+	for range messages {
+		if err := st.fr.WriteData(1, false, []byte{0, 0, 0, 0, 0}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.fr.WriteData(1, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Let the transport queue the frames before the handler reads any of them.
+	time.Sleep(300 * time.Millisecond)
+	close(release)
+	select {
+	case n := <-counted:
+		if n != messages {
+			t.Fatalf("handler received %d messages, want %d", n, messages)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not finish reading the queued messages")
+	}
+}
+
 // Unary methods share the streaming server path in v1.85, so the policy must
 // bound both directions of a unary call without disturbing a healthy one.
 func (s) TestReceivePolicyUnaryTCP(t *testing.T) {
