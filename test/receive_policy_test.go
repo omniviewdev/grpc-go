@@ -872,6 +872,47 @@ func (s) TestClientReceivePolicyPreservesNormalTrailersTCP(t *testing.T) {
 	}
 }
 
+// A non-gRPC response body is not a stream of gRPC messages. Its bytes must
+// not be parsed against the receive limits, so the transport can still surface
+// the HTTP status and the beginning of the body.
+func (s) TestClientReceivePolicyNonGRPCResponseTCP(t *testing.T) {
+	const htmlPayload = `<html><body>Hello World</body></html>`
+	const wantErr = `unexpected HTTP status code received from server: 200 (OK); transport: received unexpected content-type "text/html"
+data: "<html><body>Hello World</body></html>"`
+	for _, test := range []struct {
+		name     string
+		callOpts []grpc.CallOption
+	}{
+		{"max_size", []grpc.CallOption{grpc.MaxCallRecvMsgSize(16)}},
+		{"partial_message_timeout", []grpc.CallOption{grpc.PartialMessageReadTimeout(time.Second)}},
+		{"both", []grpc.CallOption{grpc.MaxCallRecvMsgSize(16), grpc.PartialMessageReadTimeout(time.Second)}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			lis, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lis.Close()
+			hs := &httpServer{responses: []httpServerResponse{{
+				headers:  [][]string{{":status", "200", "content-type", "text/html"}},
+				payloads: [][]byte{[]byte(htmlPayload)},
+			}}}
+			hs.start(t, lis)
+			cc, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cc.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_, err = testgrpc.NewTestServiceClient(cc).EmptyCall(ctx, &testpb.Empty{}, test.callOpts...)
+			if status.Code(err) != codes.Unknown || status.Convert(err).Message() != wantErr {
+				t.Fatalf("EmptyCall() = %v, want code Unknown with message %q", err, wantErr)
+			}
+		})
+	}
+}
+
 func (s) TestReceivePolicyLogicalTimeoutWithNextFrameTCP(t *testing.T) {
 	const timeout = 600 * time.Millisecond
 	lis, err := net.Listen("tcp", "127.0.0.1:0")

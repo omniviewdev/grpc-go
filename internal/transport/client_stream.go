@@ -67,6 +67,12 @@ type ClientStream struct {
 func (s *ClientStream) startNonGRPCDataCollection(st *status.Status) {
 	s.nonGRPCStatus = st
 	s.nonGRPCDataBuf = make([]byte, 0, nonGRPCDataMaxLen)
+	if s.receivePolicy != nil {
+		// The body is not a sequence of gRPC messages, so its bytes must not be
+		// parsed against the receive limits. An incomplete HTTP/2 DATA frame is
+		// still bounded by the physical frame deadline.
+		s.receivePolicy.stop()
+	}
 }
 
 // finalizeNonGRPCStatus builds the terminal status by appending the collected
