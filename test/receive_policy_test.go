@@ -970,7 +970,7 @@ func (s) TestReceivePolicyServerDeadlineStatusTCP(t *testing.T) {
 	st.greet()
 	st.writeHeaders(http2.HeadersFrameParam{
 		StreamID: 1,
-		BlockFragment: st.encodeHeader(":method", "POST", ":path", receivePolicyMethod,
+		BlockFragment: st.encodeHeader(":method", "POST", ":path", receivePolicyMethod, ":authority", "localhost",
 			"content-type", "application/grpc", "te", "trailers", "grpc-timeout", "500m"),
 		EndHeaders: true,
 	})
@@ -1005,7 +1005,7 @@ func (s) TestReceivePolicyUnconfiguredMethodTCP(t *testing.T) {
 	defer conn.Close()
 	st := newServerTesterFromConn(t, conn)
 	st.greet()
-	st.writeHeadersGRPC(1, strings.TrimPrefix(receivePolicyMethod, "/"), false)
+	st.writeHeadersGRPC(1, receivePolicyMethod, false)
 	time.Sleep(300 * time.Millisecond)
 	if err := st.fr.WriteData(1, false, []byte{0, 0, 0, 0, 0}); err != nil {
 		t.Fatal(err)
@@ -1049,7 +1049,7 @@ func (s) TestReceivePolicyCancelBeforeDeadlineTCP(t *testing.T) {
 	st.greet()
 	st.writeHeaders(http2.HeadersFrameParam{
 		StreamID: 1,
-		BlockFragment: st.encodeHeader(":method", "POST", ":path", receivePolicyMethod,
+		BlockFragment: st.encodeHeader(":method", "POST", ":path", receivePolicyMethod, ":authority", "localhost",
 			"content-type", "application/grpc", "te", "trailers", "grpc-timeout", "500m"),
 		EndHeaders: true,
 	})
