@@ -10,8 +10,8 @@ RPC framework that puts mobile and HTTP/2 first. For more information see the
 
 ## Omniview maintenance fork
 
-This fork adds scoped receive controls to upstream gRPC-Go v1.79.2.
-The maintenance branch is `omniview-v1.79`.
+This fork adds scoped receive controls to upstream gRPC-Go v1.85.0.
+The maintenance branch is `omniview-v1.85`.
 
 See [the receive policy](Documentation/compression.md) for the method-scoped
 size limits, partial-message deadlines, failure boundaries, and native
