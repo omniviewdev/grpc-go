@@ -66,7 +66,7 @@ func (p *receiveTrackingPool) Get(n int) *[]byte {
 
 func (p *receiveTrackingPool) Put(b *[]byte) { p.put <- b }
 
-func TestReceivePolicyTCP(t *testing.T) {
+func (s) TestReceivePolicyTCP(t *testing.T) {
 	const timeout = 150 * time.Millisecond
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -181,7 +181,7 @@ func TestReceivePolicyTCP(t *testing.T) {
 	}
 }
 
-func TestReceivePolicyCompressedExpansionTCP(t *testing.T) {
+func (s) TestReceivePolicyCompressedExpansionTCP(t *testing.T) {
 	const method = "/grpc.testing.TestService/UnaryCall"
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -206,7 +206,7 @@ func TestReceivePolicyCompressedExpansionTCP(t *testing.T) {
 	}
 }
 
-func TestClientPartialMessageTimeoutTCP(t *testing.T) {
+func (s) TestClientPartialMessageTimeoutTCP(t *testing.T) {
 	for _, partial := range [][]byte{{0}, {0, 0, 0, 0, 3, 1}} {
 		t.Run(string(rune(len(partial)+'0')), func(t *testing.T) {
 			const timeout = 120 * time.Millisecond
@@ -279,7 +279,7 @@ func TestClientPartialMessageTimeoutTCP(t *testing.T) {
 	}
 }
 
-func TestReceivePolicyBeforeApplicationReadTCP(t *testing.T) {
+func (s) TestReceivePolicyBeforeApplicationReadTCP(t *testing.T) {
 	const timeout = 100 * time.Millisecond
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -321,7 +321,7 @@ func TestReceivePolicyBeforeApplicationReadTCP(t *testing.T) {
 	}
 }
 
-func TestReceivePolicyServeHTTPRefusalTCP(t *testing.T) {
+func (s) TestReceivePolicyServeHTTPRefusalTCP(t *testing.T) {
 	srv := grpc.NewServer(grpc.MethodMaxRecvMsgSize(receivePolicyMethod, 64))
 	testgrpc.RegisterTestServiceServer(srv, &funcServer{unaryCall: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
 		return &testpb.SimpleResponse{}, nil
@@ -350,7 +350,7 @@ func TestReceivePolicyServeHTTPRefusalTCP(t *testing.T) {
 	}
 }
 
-func TestReceivePolicyPartialHTTP2FrameTCP(t *testing.T) {
+func (s) TestReceivePolicyPartialHTTP2FrameTCP(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -404,7 +404,7 @@ func TestReceivePolicyPartialHTTP2FrameTCP(t *testing.T) {
 	}
 }
 
-func TestClientPartialHTTP2FrameTCP(t *testing.T) {
+func (s) TestClientPartialHTTP2FrameTCP(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -517,7 +517,7 @@ func TestClientPartialHTTP2FrameTCP(t *testing.T) {
 	}
 }
 
-func TestClientReceivePolicyCompressedTCP(t *testing.T) {
+func (s) TestClientReceivePolicyCompressedTCP(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -556,7 +556,7 @@ func TestClientReceivePolicyCompressedTCP(t *testing.T) {
 	}
 }
 
-func TestReceivePolicyReleasesUnreadBufferTCP(t *testing.T) {
+func (s) TestReceivePolicyReleasesUnreadBufferTCP(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -607,7 +607,7 @@ func TestReceivePolicyReleasesUnreadBufferTCP(t *testing.T) {
 	}
 }
 
-func TestReceivePolicyOversizePartialHTTP2FrameTCP(t *testing.T) {
+func (s) TestReceivePolicyOversizePartialHTTP2FrameTCP(t *testing.T) {
 	for _, complete := range []bool{true, false} {
 		t.Run(fmt.Sprintf("complete=%v", complete), func(t *testing.T) {
 			lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -694,7 +694,7 @@ func TestReceivePolicyOversizePartialHTTP2FrameTCP(t *testing.T) {
 	}
 }
 
-func TestReceivePolicyPaddedPhysicalFrameTCP(t *testing.T) {
+func (s) TestReceivePolicyPaddedPhysicalFrameTCP(t *testing.T) {
 	for _, cancelHandler := range []bool{false, true} {
 		t.Run(fmt.Sprintf("cancel=%v", cancelHandler), func(t *testing.T) {
 			lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -761,7 +761,7 @@ func TestReceivePolicyPaddedPhysicalFrameTCP(t *testing.T) {
 	}
 }
 
-func TestClientReceivePolicyCancellationReleasesLastTCP(t *testing.T) {
+func (s) TestClientReceivePolicyCancellationReleasesLastTCP(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -841,7 +841,7 @@ func TestClientReceivePolicyCancellationReleasesLastTCP(t *testing.T) {
 	}
 }
 
-func TestClientReceivePolicyPreservesNormalTrailersTCP(t *testing.T) {
+func (s) TestClientReceivePolicyPreservesNormalTrailersTCP(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -872,7 +872,7 @@ func TestClientReceivePolicyPreservesNormalTrailersTCP(t *testing.T) {
 	}
 }
 
-func TestReceivePolicyLogicalTimeoutWithNextFrameTCP(t *testing.T) {
+func (s) TestReceivePolicyLogicalTimeoutWithNextFrameTCP(t *testing.T) {
 	const timeout = 600 * time.Millisecond
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -947,7 +947,7 @@ func TestReceivePolicyLogicalTimeoutWithNextFrameTCP(t *testing.T) {
 	}
 }
 
-func TestReceivePolicyServerDeadlineStatusTCP(t *testing.T) {
+func (s) TestReceivePolicyServerDeadlineStatusTCP(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -984,7 +984,7 @@ func TestReceivePolicyServerDeadlineStatusTCP(t *testing.T) {
 	}
 }
 
-func TestReceivePolicyUnconfiguredMethodTCP(t *testing.T) {
+func (s) TestReceivePolicyUnconfiguredMethodTCP(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1021,7 +1021,7 @@ func TestReceivePolicyUnconfiguredMethodTCP(t *testing.T) {
 	}
 }
 
-func TestReceivePolicyCancelBeforeDeadlineTCP(t *testing.T) {
+func (s) TestReceivePolicyCancelBeforeDeadlineTCP(t *testing.T) {
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1078,7 +1078,7 @@ func TestReceivePolicyCancelBeforeDeadlineTCP(t *testing.T) {
 	}
 }
 
-func TestReceivePolicySlowDripPhysicalFrameTCP(t *testing.T) {
+func (s) TestReceivePolicySlowDripPhysicalFrameTCP(t *testing.T) {
 	const timeout = 400 * time.Millisecond
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1135,7 +1135,7 @@ func TestReceivePolicySlowDripPhysicalFrameTCP(t *testing.T) {
 	}
 }
 
-func TestClientReceivePolicyCancelAfterTrailersTCP(t *testing.T) {
+func (s) TestClientReceivePolicyCancelAfterTrailersTCP(t *testing.T) {
 	for _, mode := range []string{"unread", "last", "concurrent"} {
 		t.Run(mode, func(t *testing.T) {
 			lis, err := net.Listen("tcp", "127.0.0.1:0")
