@@ -206,6 +206,49 @@ func (s) TestReceivePolicyCompressedExpansionTCP(t *testing.T) {
 	}
 }
 
+// Unary methods share the streaming server path in v1.85, so the policy must
+// bound both directions of a unary call without disturbing a healthy one.
+func (s) TestReceivePolicyUnaryTCP(t *testing.T) {
+	const method = "/grpc.testing.TestService/UnaryCall"
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer(grpc.MethodMaxRecvMsgSize(method, 256), grpc.MethodPartialMessageReadTimeout(method, time.Second))
+	testgrpc.RegisterTestServiceServer(srv, &funcServer{unaryCall: func(_ context.Context, in *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
+		return &testpb.SimpleResponse{Payload: &testpb.Payload{Body: make([]byte, in.GetResponseSize())}}, nil
+	}})
+	go srv.Serve(lis)
+	defer srv.Stop()
+	cc, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client := testgrpc.NewTestServiceClient(cc)
+	call := func(requestBytes, responseBytes int) error {
+		_, err := client.UnaryCall(ctx, &testpb.SimpleRequest{
+			ResponseSize: int32(responseBytes),
+			Payload:      &testpb.Payload{Body: make([]byte, requestBytes)},
+		}, grpc.MaxCallRecvMsgSize(256), grpc.PartialMessageReadTimeout(time.Second))
+		return err
+	}
+	if err := call(16, 16); err != nil {
+		t.Fatalf("healthy unary call: %v", err)
+	}
+	if err := call(1024, 16); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("oversized request: got %v, want ResourceExhausted", err)
+	}
+	if err := call(16, 1024); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("oversized response: got %v, want ResourceExhausted", err)
+	}
+	if err := call(16, 16); err != nil {
+		t.Fatalf("unary call after rejected calls: %v", err)
+	}
+}
+
 func (s) TestClientPartialMessageTimeoutTCP(t *testing.T) {
 	for _, partial := range [][]byte{{0}, {0, 0, 0, 0, 3, 1}} {
 		t.Run(string(rune(len(partial)+'0')), func(t *testing.T) {
